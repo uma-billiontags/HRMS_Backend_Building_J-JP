@@ -1,5 +1,7 @@
 # accounts/views.py
 
+import json
+from pathlib import Path
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
@@ -84,9 +86,9 @@ def me_view(request):
         data["auth_role"] = "admin"
         data["is_tl"] = False
     else:
-        data = EmployeeSerializer(principal.instance).data  # keeps job-title `role`, e.g. "TL"
+        data = EmployeeSerializer(principal.instance).data
         data["auth_role"] = "employee"
-        data["is_tl"] = bool(principal.instance.role and principal.instance.role.strip().upper() in ["TL", "TEAM LEAD"])
+        data["is_tl"] = False
     return Response(data)
 
 
@@ -104,23 +106,85 @@ def get_all_employee_credentials(request):
     return Response(EmployeeCredentialSerializer(employees, many=True).data)
 
 
+def _get_all_active_departments():
+    """Returns sorted distinct list of departments present in Department, Employee, or Task models."""
+    from accounts.models import Department, Employee
+    from tasks.models import Task
+    dept_names = set(Department.objects.values_list("name", flat=True))
+    emp_depts = set(Employee.objects.exclude(department="").values_list("department", flat=True))
+    task_depts = set(Task.objects.exclude(department="").values_list("department", flat=True))
+    return sorted(list(dept_names.union(emp_depts).union(task_depts)))
+
+
+def _load_custom_departments():
+    """Backward compatibility helper — returns departments from DB."""
+    from accounts.models import Department
+    return list(Department.objects.values_list("name", flat=True))
+
+
+def _save_custom_departments(depts):
+    """Backward compatibility helper — persists departments to DB."""
+    from accounts.models import Department
+    for d in depts:
+        d_clean = (d or "").strip()
+        if d_clean:
+            Department.objects.get_or_create(name=d_clean)
+
+
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def get_employee_departments(request):
     """
     GET /api/auth/employees/departments/
-    Distinct department strings already in use — dropdown source, plus the
-    admin can still type a brand-new department name (Select is searchable/tag-friendly).
+    Distinct department strings already in use in DB.
     """
     if not _is_admin(request):
         return Response({"detail": "Admin only."}, status=status.HTTP_403_FORBIDDEN)
-    departments = (
-        Employee.objects.exclude(department="")
-        .values_list("department", flat=True)
-        .distinct()
-        .order_by("department")
-    )
-    return Response(list(departments))
+    return Response(_get_all_active_departments())
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def create_department_view(request):
+    """
+    POST /api/auth/employees/departments/create/
+    Body: { "name": "Department Name" }
+    """
+    if not _is_admin(request):
+        return Response({"detail": "Admin only."}, status=status.HTTP_403_FORBIDDEN)
+    name = (request.data.get("name") or "").strip()
+    if not name:
+        return Response({"detail": "Department name is required."}, status=status.HTTP_400_BAD_REQUEST)
+    
+    from accounts.models import Department
+    dept, _ = Department.objects.get_or_create(name=name)
+    all_depts = _get_all_active_departments()
+    return Response({"detail": "Department created successfully.", "name": dept.name, "departments": all_depts}, status=status.HTTP_201_CREATED)
+
+
+@api_view(["DELETE", "POST"])
+@permission_classes([IsAuthenticated])
+def delete_department_view(request):
+    """
+    POST or DELETE /api/auth/employees/departments/delete/
+    Body: { "name": "Department Name" }
+    """
+    if not _is_admin(request):
+        return Response({"detail": "Admin only."}, status=status.HTTP_403_FORBIDDEN)
+    name = (request.data.get("name") or "").strip()
+    if not name:
+        return Response({"detail": "Department name is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+    if Employee.objects.filter(department=name).exists():
+        return Response(
+            {"detail": f"Cannot delete '{name}' because active team members are assigned to it."},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    from accounts.models import Department
+    Department.objects.filter(name=name).delete()
+    all_depts = _get_all_active_departments()
+    return Response({"detail": "Department removed.", "departments": all_depts})
 
 
 @api_view(["POST"])
@@ -158,11 +222,8 @@ def bulk_create_employees(request):
     existing_admin_emails = set(Admin.objects.values_list("email", flat=True))
     existing_ids = set(Employee.objects.exclude(employee_id__isnull=True).exclude(employee_id="").values_list("employee_id", flat=True))
 
-    tls = list(Employee.objects.filter(is_active=True))
-    tl_by_id = {tl.id: tl for tl in tls}
-    tl_by_email = {tl.email.strip().lower(): tl for tl in tls}
-    tl_by_emp_id = {tl.employee_id.strip().lower(): tl for tl in tls if tl.employee_id}
-    tl_by_name = {tl.name.strip().lower(): tl for tl in tls}
+    # All team members report directly to Admin
+    belong_to_tl = None
 
     seen_emails_in_batch = set()
     seen_ids_in_batch = set()
@@ -219,23 +280,6 @@ def bulk_create_employees(request):
             errors.append({"row": index, "employee_id": emp_id, "email": email, "error": f"Duplicate Member ID '{emp_id}' within this batch."})
             continue
 
-        # Resolve Reporting To / TL (Direct to Admin if Admin/blank/0, or if role is TL)
-        belong_to_tl = None
-        is_tl_role = bool(role and role.strip().upper() in ["TL", "TEAM LEAD"])
-        reporting_target = item.get("belong_to_tl") or item.get("reporting_to")
-        if not is_tl_role and reporting_target is not None:
-            target_str = str(reporting_target).strip()
-            if target_str.lower() not in ["admin", "direct", "direct to admin", "none", "0", ""]:
-                if isinstance(reporting_target, int) or (isinstance(reporting_target, str) and reporting_target.isdigit()):
-                    tl_id = int(reporting_target)
-                    belong_to_tl = tl_by_id.get(tl_id)
-                if not belong_to_tl and target_str.lower() in tl_by_email:
-                    belong_to_tl = tl_by_email[target_str.lower()]
-                if not belong_to_tl and target_str.lower() in tl_by_emp_id:
-                    belong_to_tl = tl_by_emp_id[target_str.lower()]
-                if not belong_to_tl and target_str.lower() in tl_by_name:
-                    belong_to_tl = tl_by_name[target_str.lower()]
-
         if not password:
             password = f"Welcome@{emp_id}"
 
@@ -245,7 +289,7 @@ def bulk_create_employees(request):
             email=email,
             department=department,
             role=role,
-            belong_to_tl=belong_to_tl,
+            belong_to_tl=None,
             is_active=bool(is_active),
         )
         emp.set_password(password)
@@ -255,10 +299,6 @@ def bulk_create_employees(request):
         existing_ids.add(emp_id)
         seen_emails_in_batch.add(email_lower)
         seen_ids_in_batch.add(emp_id_lower)
-        tl_by_id[emp.id] = emp
-        tl_by_email[emp.email.lower()] = emp
-        tl_by_emp_id[emp.employee_id.lower()] = emp
-        tl_by_name[emp.name.lower()] = emp
 
         created_employees.append(emp)
 

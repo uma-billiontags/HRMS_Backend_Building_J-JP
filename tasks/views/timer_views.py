@@ -62,6 +62,17 @@ def get_active_session(request):
     })
 
 
+def _get_task_owner_filter(request, task, kind, actor):
+    """Resolve owner filter for timer sessions, supporting both assignee and admin oversight."""
+    if _is_admin(request):
+        if task.assigned_to_id:
+            return {"employee": task.assigned_to}
+        elif task.assigned_to_admin_id:
+            return {"admin": task.assigned_to_admin}
+        return {"admin": actor}
+    return {"employee": actor} if kind == "employee" else {"admin": actor}
+
+
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def start_task(request, pk):
@@ -70,22 +81,22 @@ def start_task(request, pk):
         return Response({"detail": "Only employees or admins can start a timer."}, status=status.HTTP_403_FORBIDDEN)
 
     task = get_object_or_404(Task, pk=pk)
-    if not _is_task_assignee(request, task):
+    if not (_is_admin(request) or _is_task_assignee(request, task)):
         return Response({"detail": "This task isn't assigned to you."}, status=status.HTTP_403_FORBIDDEN)
 
     if task.task_status != Task.Status.NOT_STARTED:
         return Response({"detail": "This task has already been started. Use Resume instead."}, status=status.HTTP_400_BAD_REQUEST)
 
     with transaction.atomic():
-        owner_filter = {"employee": actor} if kind == "employee" else {"admin": actor}
+        owner_filter = _get_task_owner_filter(request, task, kind, actor)
         
         # ✅ FIX: Exclude THIS task so an orphaned session on the same task doesn't block it
         if TimerSession.objects.select_for_update().filter(end_time__isnull=True, **owner_filter).exclude(task=task).exists():
             return Response({"detail": "You already have an active timer running on another task. Pause or submit it first."}, status=status.HTTP_409_CONFLICT)
 
         # ✅ FIX: If there was a leftover open session on this task, close it cleanly
-        task.sessions.filter(end_time__isnull=True, **owner_filter).update(end_time=timezone_now())
-        TaskPauseLog.objects.filter(end_time__isnull=True, **owner_filter).update(end_time=timezone_now())
+        task.sessions.filter(end_time__isnull=True).update(end_time=timezone_now())
+        TaskPauseLog.objects.filter(task=task, end_time__isnull=True).update(end_time=timezone_now())
 
         session_kwargs = {"task": task, **owner_filter}
         TimerSession.objects.create(**session_kwargs)
@@ -103,13 +114,16 @@ def pause_task(request, pk):
         return Response({"detail": "Only employees or admins can pause a timer."}, status=status.HTTP_403_FORBIDDEN)
 
     task = get_object_or_404(Task, pk=pk)
-    if not _is_task_assignee(request, task):
+    if not (_is_admin(request) or _is_task_assignee(request, task)):
         return Response({"detail": "This task isn't assigned to you."}, status=status.HTTP_403_FORBIDDEN)
 
-    owner_filter = {"employee": actor} if kind == "employee" else {"admin": actor}
-    session = TimerSession.objects.filter(task=task, end_time__isnull=True, **owner_filter).first()
+    owner_filter = _get_task_owner_filter(request, task, kind, actor)
+    session = TimerSession.objects.filter(task=task, end_time__isnull=True).first()
     if not session:
-        return Response({"detail": "There's no active timer session to pause."}, status=status.HTTP_400_BAD_REQUEST)
+        # If no active session, still transition status to paused
+        task.task_status = Task.Status.PAUSED
+        task.save(update_fields=["task_status"])
+        return Response(TaskListSerializer(task).data)
 
     pause_type = request.data.get("pause_type", "break")
     break_option = request.data.get("break_option", "")
@@ -132,8 +146,8 @@ def pause_task(request, pk):
         task.save(update_fields=["task_status"])
         task.recalc_total_time()
 
-        # Close any previous open pause log for this actor
-        TaskPauseLog.objects.filter(end_time__isnull=True, **owner_filter).update(end_time=timezone_now())
+        # Close any previous open pause log for this task
+        TaskPauseLog.objects.filter(task=task, end_time__isnull=True).update(end_time=timezone_now())
 
         pause_log = TaskPauseLog.objects.create(
             task=task,
@@ -177,19 +191,19 @@ def resume_task(request, pk):
         return Response({"detail": "Only employees or admins can resume a timer."}, status=status.HTTP_403_FORBIDDEN)
 
     task = get_object_or_404(Task, pk=pk)
-    if not _is_task_assignee(request, task):
+    if not (_is_admin(request) or _is_task_assignee(request, task)):
         return Response({"detail": "This task isn't assigned to you."}, status=status.HTTP_403_FORBIDDEN)
 
     if task.task_status not in (Task.Status.PAUSED, Task.Status.REWORK_NEEDED):
         return Response({"detail": "This task isn't paused or awaiting rework, so it can't be resumed."}, status=status.HTTP_400_BAD_REQUEST)
 
     with transaction.atomic():
-        owner_filter = {"employee": actor} if kind == "employee" else {"admin": actor}
+        owner_filter = _get_task_owner_filter(request, task, kind, actor)
         if TimerSession.objects.select_for_update().filter(end_time__isnull=True, **owner_filter).exclude(task=task).exists():
             return Response({"detail": "You already have an active timer running on another task. Pause or submit it first."}, status=status.HTTP_409_CONFLICT)
         
-        # Close any open pause logs for this task & actor
-        open_pauses = TaskPauseLog.objects.filter(end_time__isnull=True, **owner_filter)
+        # Close any open pause logs for this task
+        open_pauses = TaskPauseLog.objects.filter(task=task, end_time__isnull=True)
         pause_duration = 0
         for p in open_pauses:
             p.close()
@@ -222,34 +236,40 @@ def submit_task(request, pk):
         return Response({"detail": "Only employees or admins can submit a task."}, status=status.HTTP_403_FORBIDDEN)
 
     task = get_object_or_404(Task, pk=pk)
-    if not _is_task_assignee(request, task):
+    if not (_is_admin(request) or _is_task_assignee(request, task)):
         return Response({"detail": "This task isn't assigned to you."}, status=status.HTTP_403_FORBIDDEN)
 
-    if task.task_status not in (Task.Status.IN_PROGRESS, Task.Status.PAUSED):
+    if task.task_status not in (Task.Status.IN_PROGRESS, Task.Status.PAUSED, Task.Status.NOT_STARTED):
         return Response({"detail": "This task must be in progress or paused to submit it."}, status=status.HTTP_400_BAD_REQUEST)
 
-    serializer = TaskSubmitSerializer(data=request.data)
-    serializer.is_valid(raise_exception=True)
+    task_sheet_link = request.data.get("task_sheet_link", "").strip()
+    employee_remarks = request.data.get("employee_remarks", "").strip()
 
-    owner_filter = {"employee": actor} if kind == "employee" else {"admin": actor}
+    owner_filter = _get_task_owner_filter(request, task, kind, actor)
 
     with transaction.atomic():
-        open_session = TimerSession.objects.filter(task=task, end_time__isnull=True, **owner_filter).first()
+        open_session = TimerSession.objects.filter(task=task, end_time__isnull=True).first()
         if open_session:
             open_session.close()
 
         # Close any open pause log
-        TaskPauseLog.objects.filter(task=task, end_time__isnull=True, **owner_filter).update(end_time=timezone_now())
+        TaskPauseLog.objects.filter(task=task, end_time__isnull=True).update(end_time=timezone_now())
 
         from_status = task.task_status
-        task.task_sheet_link = serializer.validated_data["task_sheet_link"]
-        task.employee_remarks = serializer.validated_data["employee_remarks"]
+        task.task_sheet_link = task_sheet_link
+        task.employee_remarks = employee_remarks
         task.submitted_date = timezone_now()
         task.task_status = Task.Status.RESUBMITTED if task.rework_count > 0 else Task.Status.SUBMITTED
         task.save(update_fields=["task_sheet_link", "employee_remarks", "submitted_date", "task_status"])
 
         attachment_kwargs = {"uploaded_by": actor} if kind == "employee" else {"uploaded_by_admin": actor}
         for f in request.FILES.getlist("attachments"):
+            ext = os.path.splitext(f.name)[1].lower() if hasattr(f, "name") else ""
+            if ext in {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".m4v", ".3gp"}:
+                return Response(
+                    {"detail": f"Videos are not allowed ('{f.name}'). Only images, screenshots, docx, ppt, pdf, and excel files are supported."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
             TaskAttachment.objects.create(task=task, file=f, **attachment_kwargs)
 
         if open_session:
@@ -261,9 +281,9 @@ def submit_task(request, pk):
             details={"task_sheet_link": task.task_sheet_link, "attachment_count": len(request.FILES.getlist("attachments"))},
         )
 
-        # Notify creator/TL of submission
+        # Notify Admin of submission
         submitter_name = task.assignee_name or "Assignee"
-        notified_recipients = set()
+        from accounts.models import Admin
 
         if task.assigned_by_admin:
             send_notification(
@@ -274,29 +294,14 @@ def submit_task(request, pk):
                 action_url="/admin/review_tasks",
                 sender_name=submitter_name,
             )
-            notified_recipients.add(f"admin_{task.assigned_by_admin_id}")
-
-        if task.assigned_by_employee and f"emp_{task.assigned_by_employee_id}" not in notified_recipients:
-            send_notification(
-                recipient=task.assigned_by_employee,
-                title="Task Submitted for Review",
-                message=f"{submitter_name} submitted task: '{task.task_name}' for review.",
-                event_type=Notification.EventType.TASK_SUBMITTED,
-                action_url="/employee/tl_review_tasks",
-                sender_name=submitter_name,
-            )
-            notified_recipients.add(f"emp_{task.assigned_by_employee_id}")
-
-        # Also notify belonging TL if different from assigned_by
-        if task.assigned_to and task.assigned_to.belong_to_tl:
-            tl = task.assigned_to.belong_to_tl
-            if f"emp_{tl.id}" not in notified_recipients:
+        else:
+            for adm in Admin.objects.filter(is_active=True):
                 send_notification(
-                    recipient=tl,
-                    title="Team Task Submitted for Review",
+                    recipient=adm,
+                    title="Task Submitted for Review",
                     message=f"{submitter_name} submitted task: '{task.task_name}' for review.",
                     event_type=Notification.EventType.TASK_SUBMITTED,
-                    action_url="/employee/tl_review_tasks",
+                    action_url="/admin/review_tasks",
                     sender_name=submitter_name,
                 )
 

@@ -2,7 +2,10 @@
 
 from .task_views import (
     create_task, assign_task, edit_task, create_and_assign_task, get_all_departments,
+    get_departments_overview, get_department_projects, get_project_tasks, quick_create_task,
+    task_attachments_view, task_comments_view,
     get_all_employees, get_priority_choices, get_all_admins, get_admin_my_tasks,
+    get_all_reporters,
     task_master_view, task_master_detail_view
 )
 from .timer_views import (

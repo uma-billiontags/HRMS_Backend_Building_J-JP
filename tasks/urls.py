@@ -9,9 +9,15 @@ urlpatterns = [
     path("create_task/", views.create_task, name="task-create"),
     path("create_and_assign/", views.create_and_assign_task, name="task-create-assign"),
     path("<int:pk>/edit/", views.edit_task, name="task-edit"),
+    path("<int:pk>/attachments/", views.task_attachments_view, name="task-attachments"),
+    path("<int:pk>/comments/", views.task_comments_view, name="task-comments"),
     path("assign_task/<int:pk>/", views.assign_task, name="task-assign"),
 
     path("get_all_departments/", views.get_all_departments, name="task-departments"),
+    path("departments/overview/", views.get_departments_overview, name="departments-overview"),
+    path("departments/projects/", views.get_department_projects, name="department-projects"),
+    path("project_tasks/", views.get_project_tasks, name="project-tasks"),
+    path("quick_create/", views.quick_create_task, name="task-quick-create"),
     path("get_all_employees/", views.get_all_employees, name="task-employees"),
     path("get_priority_choices/", views.get_priority_choices, name="task-priorities"),
 
@@ -75,6 +81,7 @@ urlpatterns = [
     path("reports/rating_trends/", views.get_employee_rating_trends, name="reports-rating-trends"),
     
     path("get_all_admins/", views.get_all_admins, name="task-admins"),
+    path("get_all_reporters/", views.get_all_reporters, name="task-reporters"),
     path("admin_my_tasks/", views.get_admin_my_tasks, name="admin-my-tasks"),
 
     # ── Notifications ────────────────────────────────────────────────────

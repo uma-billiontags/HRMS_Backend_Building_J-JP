@@ -113,48 +113,27 @@ def get_recurring_tasks(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def get_my_recurring_tasks(request):
-    """
-    GET /api/tasks/recurring/mine/
-    TL-only. Mirrors tl_tasks vs get_all_tasks — only recurring rules
-    THIS TL personally created, not admin-created or other TLs' rules.
-    """
-    if not _is_tl(request):
-        return Response({"detail": "Team leads only."}, status=status.HTTP_403_FORBIDDEN)
-    employee = _current_employee(request)
-    defs = RecurringTaskDefinition.objects.filter(assigned_by_employee=employee)
-    return Response(RecurringTaskDefinitionSerializer(defs, many=True).data)
+    """Deprecated: TL concept removed."""
+    return Response([])
 
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def create_recurring_task(request):
-    if not _can_manage_tasks(request):
-        return Response({"detail": "Only admins or team leads can create tasks."}, status=status.HTTP_403_FORBIDDEN)
-
-    # NEW — same rule as assign_task/create_and_assign_task: only a TL can hand
-    # a recurring task to an Admin.
-    if request.data.get("assigned_to_admin") and not _is_tl(request):
-        return Response({"detail": "Only team leads can assign a task to an admin."}, status=status.HTTP_403_FORBIDDEN)
+    if not _is_admin(request):
+        return Response({"detail": "Only admins can create tasks."}, status=status.HTTP_403_FORBIDDEN)
 
     serializer = RecurringTaskDefinitionCreateSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
 
-    if _is_admin(request):
-        definition = serializer.save(assigned_by_admin=request.user.instance)
-    else:
-        definition = serializer.save(assigned_by_employee=request.user.instance)
-
+    definition = serializer.save(assigned_by_admin=request.user.instance)
     generate_recurring_tasks()
 
     return Response(RecurringTaskDefinitionSerializer(definition).data, status=status.HTTP_201_CREATED)
 
 def _owns_recurring_for_management(request, definition):
-    """Admin: any rule. TL: only rules they personally created — same
-    ownership pattern as _owns_task_for_management for regular tasks."""
-    if _is_admin(request):
-        return True
-    employee = _current_employee(request)
-    return employee is not None and employee.role == "TL" and definition.assigned_by_employee_id == employee.id
+    """Admin-only."""
+    return _is_admin(request)
 
 
 @api_view(["POST"])
@@ -162,14 +141,11 @@ def _owns_recurring_for_management(request, definition):
 def stop_recurring_task(request, pk):
     """
     POST /api/tasks/recurring/<id>/stop/
-    Admin can stop any rule; a TL can only stop rules they created.
-    Deactivates the rule — no more future days generated. Already-generated
-    Task rows (including today's) are untouched, same as hold/cancel: history
-    is never rewritten.
+    Admin can stop any rule.
     """
     definition = get_object_or_404(RecurringTaskDefinition, pk=pk)
-    if not _owns_recurring_for_management(request, definition):
-        return Response({"detail": "You can only stop recurring tasks you created."}, status=status.HTTP_403_FORBIDDEN)
+    if not _is_admin(request):
+        return Response({"detail": "Only admins can stop recurring tasks."}, status=status.HTTP_403_FORBIDDEN)
 
     definition.is_active = False
     definition.save(update_fields=["is_active"])
@@ -184,13 +160,7 @@ def stop_recurring_task(request, pk):
 @permission_classes([IsAuthenticated])
 def get_all_tasks(request):
     generate_recurring_tasks()
-    if _is_admin(request):
-        # Admin does not see tasks created by TLs (unless assigned to admin)
-        tasks = task_list_queryset().filter(
-            Q(assigned_by_employee__isnull=True) | Q(assigned_to_admin__isnull=False)
-        )
-    else:
-        tasks = task_list_queryset()
+    tasks = task_list_queryset()
     return Response(TaskListSerializer(tasks, many=True).data)
 
 @api_view(["GET"])
@@ -201,28 +171,20 @@ def get_my_tasks(request):
     if employee is None:
         return Response({"detail": "Employees only."}, status=status.HTTP_403_FORBIDDEN)
     
-    # today = timezone.localdate()
-    # # Filter so only tasks whose start_date has arrived (or start_date is null/today) are shown
-    # tasks = task_list_queryset().filter(assigned_to=employee).filter(
-    #     Q(start_date__isnull=True) | Q(start_date__lte=today)
-    # )
+    mode = request.query_params.get("mode", "").strip().lower()
     tasks = task_list_queryset().filter(assigned_to=employee)
+    if mode == "normal":
+        tasks = tasks.filter(recurring_source__isnull=True)
+    elif mode == "recurring":
+        tasks = tasks.filter(recurring_source__isnull=False)
     return Response(TaskListSerializer(tasks, many=True).data)
 
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def get_tl_tasks(request):
-    generate_recurring_tasks()
-    if not _is_tl(request):
-        return Response({"detail": "Team leads only."}, status=status.HTTP_403_FORBIDDEN)
-    employee = _current_employee(request)
-    # Show tasks created by this TL OR assigned to team members belonging to this TL
-    tasks = task_list_queryset().filter(
-        Q(assigned_by_employee=employee) |
-        Q(assigned_to__belong_to_tl=employee)
-    ).distinct()
-    return Response(TaskListSerializer(tasks, many=True).data)
+    """Deprecated: TL concept removed."""
+    return Response([])
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])

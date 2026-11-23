@@ -401,22 +401,10 @@ def get_daily_timeline(request):
         ]
     }
 
-    # Case 1: Employee logged in (always sees their own data, unless TL viewing their team member)
+    # Case 1: Employee logged in (always sees their own data)
     if not is_admin:
         target_emp = current_emp
         team_members_list = []
-        if _is_tl(request):
-            team_members = Employee.objects.filter(belong_to_tl=current_emp, is_active=True).order_by("name")
-            team_members_list = [
-                {"id": current_emp.id, "name": f"{current_emp.name} (My Details)", "department": current_emp.department}
-            ] + [{"id": e.id, "name": e.name, "department": e.department} for e in team_members]
-
-            if employee_param and employee_param.isdigit():
-                found = team_members.filter(pk=int(employee_param)).first()
-                if found:
-                    target_emp = found
-                elif int(employee_param) == current_emp.id:
-                    target_emp = current_emp
 
         if mode == "week":
             days = []
@@ -540,32 +528,12 @@ def get_assigned_hours_tracking(request):
     actor_role = "all"
 
     employees_list = []
-    is_tl_user = False
     if not is_admin:
-        if _is_tl(request):
-            is_tl_user = True
-            team_members = Employee.objects.filter(belong_to_tl=current_emp, is_active=True).order_by("name")
-            target_emp = current_emp
-            if employee_param and employee_param.isdigit():
-                found = team_members.filter(pk=int(employee_param)).first()
-                if found:
-                    target_emp = found
-                elif int(employee_param) == current_emp.id:
-                    target_emp = current_emp
-
-            base_tasks = task_list_queryset().filter(assigned_to=target_emp)
-            actor_id = target_emp.id
-            actor_name = target_emp.name
-            actor_role = "employee"
-            employees_list = [
-                {"id": current_emp.id, "name": f"{current_emp.name} (My Details)", "department": current_emp.department}
-            ] + [{"id": e.id, "name": e.name, "department": e.department} for e in team_members]
-        else:
-            # Regular employee viewing their own
-            base_tasks = task_list_queryset().filter(assigned_to=current_emp)
-            actor_id = current_emp.id
-            actor_name = current_emp.name
-            actor_role = "employee"
+        # Regular employee viewing their own
+        base_tasks = task_list_queryset().filter(assigned_to=current_emp)
+        actor_id = current_emp.id
+        actor_name = current_emp.name
+        actor_role = "employee"
     else:
         # Admin
         employees_list = [
@@ -796,39 +764,6 @@ def get_monthly_performance_report(request):
             target_emp = all_emps.first()
             if not target_emp and admins.exists():
                 target_admin = admins.first()
-
-    elif is_tl_user:
-        team_members = Employee.objects.filter(belong_to_tl=current_emp, is_active=True).order_by("name")
-        employees_dropdown = [
-            {
-                "id": current_emp.id,
-                "name": f"{current_emp.name} (My Details)",
-                "role": current_emp.role,
-                "department": current_emp.department,
-                "employee_id": current_emp.employee_id or "",
-                "is_admin": False,
-            }
-        ] + [
-            {
-                "id": e.id,
-                "name": e.name,
-                "role": e.role,
-                "department": e.department,
-                "employee_id": e.employee_id or "",
-                "is_admin": False,
-            }
-            for e in team_members
-        ]
-
-        target_emp = current_emp  # Default to TL's own data
-        if employee_param and str(employee_param).isdigit():
-            requested_id = int(employee_param)
-            if requested_id == current_emp.id:
-                target_emp = current_emp
-            else:
-                found = team_members.filter(pk=requested_id).first()
-                if found:
-                    target_emp = found
 
     else:
         # Regular employee: strictly their own data, no dropdown

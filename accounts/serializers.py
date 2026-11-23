@@ -104,21 +104,8 @@ class EmployeeWriteSerializer(serializers.ModelSerializer):
         if self.instance is None and not attrs.get("password"):
             raise serializers.ValidationError({"password": "Password is required when creating a new team member."})
 
-        role = attrs.get("role")
-        if role is None and self.instance:
-            role = self.instance.role
-
-        is_tl_role = bool(role and role.strip().upper() in ["TL", "TEAM LEAD"])
-        if is_tl_role:
-            attrs["belong_to_tl"] = None
-        else:
-            belong_to_tl = attrs.get("belong_to_tl")
-            if belong_to_tl:
-                if self.instance and belong_to_tl.pk == self.instance.pk:
-                    raise serializers.ValidationError({"belong_to_tl": "A team member cannot report to themselves."})
-                if not (belong_to_tl.role and belong_to_tl.role.strip().upper() in ["TL", "TEAM LEAD"]):
-                    raise serializers.ValidationError({"belong_to_tl": "Selected member is not a Team Lead."})
-
+        # All team members report directly to Admin
+        attrs["belong_to_tl"] = None
         return attrs
     
     def create(self, validated_data):

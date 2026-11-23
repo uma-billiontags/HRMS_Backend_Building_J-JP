@@ -7,9 +7,22 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 
 
 class TaskAttachmentSerializer(serializers.ModelSerializer):
+    name = serializers.SerializerMethodField()
+    size = serializers.SerializerMethodField()
+
     class Meta:
         model = TaskAttachment
-        fields = ["id", "file", "uploaded_at"]
+        fields = ["id", "file", "name", "size", "uploaded_at"]
+
+    def get_name(self, obj):
+        import os
+        return os.path.basename(obj.file.name) if obj.file else "attachment"
+
+    def get_size(self, obj):
+        try:
+            return obj.file.size
+        except Exception:
+            return 0
 
 
 class TaskListSerializer(serializers.ModelSerializer):
@@ -28,7 +41,9 @@ class TaskListSerializer(serializers.ModelSerializer):
     created_by_role = serializers.SerializerMethodField()   # "admin" | "tl" — lets the UI badge TL-created tasks
     department_name = serializers.SerializerMethodField()
     assigned_by_name = serializers.SerializerMethodField()
+    reporter_key = serializers.SerializerMethodField()
     has_active_session = serializers.SerializerMethodField()
+    is_recurring = serializers.SerializerMethodField()
     attachments = TaskAttachmentSerializer(many=True, read_only=True)
 
     class Meta:
@@ -36,13 +51,24 @@ class TaskListSerializer(serializers.ModelSerializer):
         fields = [
             "id", "task_id", "sub_task_id", "department", "project_name", "task_name", "task_details",
             "assigned_to", "assigned_to_admin", "assigned_to_name", "assignee_role", "department_name",
-            "assigned_by_name",
+            "assigned_by_name", "assigned_by_admin", "assigned_by_employee", "reporter_key",
             "priority", "start_date", "assigned_date", "due_date", "due_time", "allotted_time",
             "task_status", "total_time_taken", "remaining_or_over_time",
             "task_sheet_link", "employee_remarks", "submitted_date",
             "quality_of_task", "rating", "admin_remarks", "reviewed_date",
-            "rework_count", "has_active_session", "created_by_role", "attachments", "cancel_reason"
+            "rework_count", "has_active_session", "created_by_role", "attachments", "cancel_reason",
+            "is_recurring", "recurring_source", "task_creation_attachments"
         ]
+
+    def get_reporter_key(self, obj):
+        if obj.assigned_by_admin_id:
+            return f"admin_{obj.assigned_by_admin_id}"
+        if obj.assigned_by_employee_id:
+            return f"tl_{obj.assigned_by_employee_id}"
+        return None
+
+    def get_is_recurring(self, obj):
+        return obj.recurring_source_id is not None
 
     def get_assigned_to_name(self, obj):
         return obj.assignee_name

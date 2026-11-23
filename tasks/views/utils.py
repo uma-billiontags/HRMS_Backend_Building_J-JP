@@ -37,48 +37,19 @@ def _is_task_assignee(request, task):
     return False
 
 def _is_tl(request):
-    employee = _current_employee(request)
-    return employee is not None and bool(employee.role and employee.role.strip().upper() in ["TL", "TEAM LEAD"])
+    return False
 
 def _can_manage_tasks(request):
-    """Who's allowed to create tasks at all: Admin or a TL."""
-    return _is_admin(request) or _is_tl(request)
+    """Admin-only."""
+    return _is_admin(request)
 
 def _owns_task_for_management(request, task):
-    """Who's allowed to assign/reassign/hold/cancel THIS specific task.
-    Admin: any task. TL: only tasks they personally created."""
-    if _is_admin(request):
-        return True
-    employee = _current_employee(request)
-    return (
-        employee is not None
-        and bool(employee.role and employee.role.strip().upper() in ["TL", "TEAM LEAD"])
-        and task.assigned_by_employee_id == employee.id
-    )
+    """Admin-only."""
+    return _is_admin(request)
 
 def _can_review_task(request, task):
-    """
-    Who's allowed to review THIS task:
-    - Admin: always.
-    - TL: allowed if:
-      1) They created it AND it isn't assigned to themselves (self-assigned TL tasks go to admin).
-      2) OR Admin created it and the assigned employee belongs to this TL.
-    """
-    if _is_admin(request):
-        return True
-    employee = _current_employee(request)
-    if employee is None or not (employee.role and employee.role.strip().upper() in ["TL", "TEAM LEAD"]):
-        return False
-
-    # Case 1: TL created it (and didn't self-assign)
-    if task.assigned_by_employee_id == employee.id:
-        return task.assigned_to_id != employee.id
-
-    # Case 2: Admin created it and the assigned employee reports to this TL
-    if task.assigned_by_admin_id and task.assigned_to:
-        return getattr(task.assigned_to, "belong_to_tl_id", None) == employee.id
-
-    return False
+    """Admin-only."""
+    return _is_admin(request)
 
 
 def timezone_now():

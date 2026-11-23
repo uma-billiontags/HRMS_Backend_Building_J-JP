@@ -133,6 +133,12 @@ class Task(models.Model):
     last_activity = models.DateTimeField(auto_now=True)
     
     status_before_hold = models.CharField(max_length=20, blank=True) # Add this
+
+    # ── Task Creation Attachments ──────────────────────────────────────────
+    task_creation_attachments = models.JSONField(
+        default=list, blank=True,
+        help_text="Stores metadata/URLs of attachments added during task creation/editing",
+    )
     
     # ── Recurring-task linkage ──────────────────────────────────────────
     recurring_source = models.ForeignKey(
@@ -289,12 +295,43 @@ class Task(models.Model):
         Task = apps.get_model("tasks", "Task")
         Task.objects.filter(assigned_by__isnull=False).update(assigned_by_admin=models.F("assigned_by"))
         
+class NormalTaskManager(models.Manager):
+    def get_queryset(self):
+        return super().get_queryset().filter(recurring_source__isnull=True)
+
+
+class NormalTask(Task):
+    """Approach A: Dedicated Normal Task proxy model with project hierarchy."""
+    objects = NormalTaskManager()
+
+    class Meta:
+        proxy = True
+        verbose_name = "Normal Task"
+        verbose_name_plural = "Normal Tasks"
+
+
+class RecurringTaskManager(models.Manager):
+    def get_queryset(self):
+        return super().get_queryset().filter(recurring_source__isnull=False)
+
+
+class RecurringTask(Task):
+    """Approach A: Dedicated Recurring Task proxy model for automated routines."""
+    objects = RecurringTaskManager()
+
+    class Meta:
+        proxy = True
+        verbose_name = "Recurring Task"
+        verbose_name_plural = "Recurring Tasks"
+
+
 class TaskAttachment(models.Model):
     task = models.ForeignKey(Task, on_delete=models.CASCADE, related_name="attachments")
-    file = models.ImageField(upload_to="task_attachments/%Y/%m/")
+    file = models.FileField(upload_to="task_attachments/%Y/%m/")
     uploaded_by = models.ForeignKey(Employee, on_delete=models.SET_NULL, null=True, blank=True)
     uploaded_by_admin = models.ForeignKey(Admin, on_delete=models.SET_NULL, null=True, blank=True)  # NEW
     uploaded_at = models.DateTimeField(auto_now_add=True)
+    is_creation_attachment = models.BooleanField(default=False)
 
     class Meta:
         ordering = ["uploaded_at"]

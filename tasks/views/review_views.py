@@ -28,7 +28,6 @@ def get_review_tasks(request):
 
     tasks = task_list_queryset().filter(
         task_status__in=[Task.Status.SUBMITTED, Task.Status.RESUBMITTED, Task.Status.UNDER_REVIEW],
-        assigned_by_employee__isnull=True,
     )
     
     return Response(TaskListSerializer(tasks, many=True).data)
@@ -36,31 +35,8 @@ def get_review_tasks(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def get_tl_review_tasks(request):
-    """
-    GET /api/tasks/tl_review_tasks/
-    TL-only. Tasks eligible for review by this TL:
-      1) Tasks THIS TL created and assigned to someone else (self-assigned tasks go to admin).
-      2) Tasks created by Admin for employees who belong to THIS TL.
-    """
-    if not _is_tl(request):
-        return Response({"detail": "Team leads only."}, status=status.HTTP_403_FORBIDDEN)
-
-    employee = _current_employee(request)
-    pending_statuses = [Task.Status.SUBMITTED, Task.Status.RESUBMITTED, Task.Status.UNDER_REVIEW]
-    tasks = task_list_queryset().filter(
-        (
-            Q(assigned_by_employee=employee, task_status__in=pending_statuses)
-            & ~Q(assigned_to=employee)
-        )
-        | (
-            Q(
-                assigned_to__belong_to_tl=employee,
-                assigned_by_admin__isnull=False,
-                task_status__in=pending_statuses,
-            )
-        )
-    ).distinct()
-    return Response(TaskListSerializer(tasks, many=True).data)
+    """Deprecated: TL concept removed."""
+    return Response([])
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
@@ -107,13 +83,8 @@ def approve_task(request, pk):
         task.reviewed_date = timezone.now()
         task.task_status = Task.Status.COMPLETED
         
-        # NEW — record who approved it
-        if _is_admin(request):
-            task.reviewed_by_admin = request.user.instance
-            task.reviewed_by_employee = None
-        else:
-            task.reviewed_by_employee = request.user.instance
-            task.reviewed_by_admin = None
+        task.reviewed_by_admin = request.user.instance if _is_admin(request) else None
+        task.reviewed_by_employee = None
             
         task.save(update_fields=[
             "quality_of_task", "rating", "admin_remarks", "reviewed_date", "task_status",

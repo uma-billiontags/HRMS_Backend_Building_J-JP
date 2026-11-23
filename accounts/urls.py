@@ -10,6 +10,8 @@ urlpatterns = [
     # ── Team Access — Employees ──────────────────────────────────────────
     path("employees/", views.get_all_employee_credentials, name="employee-credentials-list"),
     path("employees/departments/", views.get_employee_departments, name="employee-departments"),
+    path("employees/departments/create/", views.create_department_view, name="employee-departments-create"),
+    path("employees/departments/delete/", views.delete_department_view, name="employee-departments-delete"),
     path("employees/create/", views.create_employee_credential, name="employee-credentials-create"),
     path("employees/bulk-create/", views.bulk_create_employees, name="employee-credentials-bulk-create"),
     path("employees/<int:pk>/edit/", views.edit_employee_credential, name="employee-credentials-edit"),

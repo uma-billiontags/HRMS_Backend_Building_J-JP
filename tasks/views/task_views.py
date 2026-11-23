@@ -22,17 +22,13 @@ from .utils import _is_admin, _current_employee, _is_tl, _can_manage_tasks, _own
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def create_task(request):
-    if not _can_manage_tasks(request):
-        return Response({"detail": "Only admins or team leads can create tasks."}, status=status.HTTP_403_FORBIDDEN)
+    if not _is_admin(request):
+        return Response({"detail": "Only admins can create tasks."}, status=status.HTTP_403_FORBIDDEN)
 
     serializer = TaskCreateSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
 
-    if _is_admin(request):
-        task = serializer.save(assigned_by_admin=request.user.instance)
-    else:
-        task = serializer.save(assigned_by_employee=request.user.instance)
-
+    task = serializer.save(assigned_by_admin=request.user.instance)
     return Response(TaskListSerializer(task).data, status=status.HTTP_201_CREATED)
 
 
@@ -40,10 +36,8 @@ def create_task(request):
 @permission_classes([IsAuthenticated])
 def assign_task(request, pk):
     task = get_object_or_404(Task, pk=pk)
-    if not _owns_task_for_management(request, task):
-        return Response({"detail": "You can only assign or reassign tasks you created."}, status=status.HTTP_403_FORBIDDEN)
-    if request.data.get("assigned_to_admin") and not _is_tl(request):
-        return Response({"detail": "Only team leads can assign a task to an admin."}, status=status.HTTP_403_FORBIDDEN)
+    if not _is_admin(request):
+        return Response({"detail": "Only admins can assign tasks."}, status=status.HTTP_403_FORBIDDEN)
 
     serializer = TaskAssignSerializer(task, data=request.data, partial=True)
     serializer.is_valid(raise_exception=True)
@@ -86,20 +80,14 @@ def assign_task(request, pk):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def create_and_assign_task(request):
-    if not _can_manage_tasks(request):
-        return Response({"detail": "Only admins or team leads can create tasks."}, status=status.HTTP_403_FORBIDDEN)
-
-    if request.data.get("assigned_to_admin") and not _is_tl(request):
-        return Response({"detail": "Only team leads can assign a task to an admin."}, status=status.HTTP_403_FORBIDDEN)
+    if not _is_admin(request):
+        return Response({"detail": "Only admins can create tasks."}, status=status.HTTP_403_FORBIDDEN)
 
     serializer = TaskCreateAssignSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
 
     with transaction.atomic():
-        if _is_admin(request):
-            task = serializer.save(assigned_by_admin=request.user.instance, task_status=Task.Status.NOT_STARTED)
-        else:
-            task = serializer.save(assigned_by_employee=request.user.instance, task_status=Task.Status.NOT_STARTED)
+        task = serializer.save(assigned_by_admin=request.user.instance, task_status=Task.Status.NOT_STARTED)
 
         log_activity(
             task, request.user, ActivityLog.Action.CREATED,
@@ -131,13 +119,284 @@ def create_and_assign_task(request):
 @permission_classes([IsAuthenticated])
 def get_all_departments(request):
     """GET /api/tasks/get_all_departments/"""
-    departments = (
-        Employee.objects.exclude(department="")
-        .values_list("department", flat=True)
+    from accounts.views import _get_all_active_departments
+    all_depts = _get_all_active_departments()
+    return Response([{"id": name, "name": name} for name in all_depts])
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def get_departments_overview(request):
+    """
+    GET /api/tasks/departments/overview/
+    Returns all departments with statistics for Trello-style cards.
+    """
+    from ..models import get_department_prefix
+    from accounts.views import _get_all_active_departments
+    all_depts = _get_all_active_departments()
+
+    data = []
+    for dept in all_depts:
+        employees_qs = Employee.objects.filter(department=dept, is_active=True)
+        tl_names = list(employees_qs.filter(role__in=["Team Lead", "TL"]).values_list("name", flat=True))
+        tasks_qs = Task.objects.filter(department=dept)
+        total_tasks = tasks_qs.count()
+
+        projects = list(
+            tasks_qs.exclude(project_name="")
+            .values_list("project_name", flat=True)
+            .distinct()
+            .order_by("project_name")
+        )
+        completed = tasks_qs.filter(task_status=Task.Status.COMPLETED).count()
+        review = tasks_qs.filter(task_status=Task.Status.UNDER_REVIEW).count()
+        rework = tasks_qs.filter(task_status=Task.Status.REWORK_NEEDED).count()
+        open_count = tasks_qs.filter(task_status__in=[
+            Task.Status.NOT_STARTED,
+            Task.Status.IN_PROGRESS,
+            Task.Status.PAUSED,
+            Task.Status.ON_HOLD,
+            Task.Status.SUBMITTED,
+            Task.Status.RESUBMITTED
+        ]).count()
+
+        completion_rate = round((completed / total_tasks * 100), 1) if total_tasks > 0 else 0
+
+        # Normal tasks vs Recurring tasks breakdown
+        normal_qs = tasks_qs.filter(recurring_source__isnull=True)
+        recurring_qs = tasks_qs.filter(recurring_source__isnull=False)
+
+        normal_projects = list(normal_qs.exclude(project_name="").values_list("project_name", flat=True).distinct())
+        recurring_projects = list(recurring_qs.exclude(project_name="").values_list("project_name", flat=True).distinct())
+
+        normal_completed = normal_qs.filter(task_status=Task.Status.COMPLETED).count()
+        normal_total = normal_qs.count()
+        normal_completion_rate = round((normal_completed / normal_total * 100), 1) if normal_total > 0 else 0
+
+        rec_completed = recurring_qs.filter(task_status=Task.Status.COMPLETED).count()
+        rec_total = recurring_qs.count()
+        rec_completion_rate = round((rec_completed / rec_total * 100), 1) if rec_total > 0 else 0
+
+        data.append({
+            "name": dept,
+            "prefix": get_department_prefix(dept),
+            "members_count": employees_qs.count(),
+            "team_leads": tl_names,
+            "projects_count": len(projects),
+            "projects": projects,
+            "total_tasks": total_tasks,
+            "open_tasks": open_count,
+            "completed_tasks": completed,
+            "review_tasks": review,
+            "rework_tasks": rework,
+            "completion_rate": completion_rate,
+            # Separate Box Metrics:
+            "normal_tasks_count": normal_total,
+            "normal_projects_count": len(normal_projects),
+            "normal_projects": normal_projects,
+            "normal_completion_rate": normal_completion_rate,
+            "recurring_tasks_count": rec_total,
+            "recurring_projects_count": len(recurring_projects),
+            "recurring_projects": recurring_projects,
+            "recurring_completion_rate": rec_completion_rate,
+        })
+    return Response(data)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def get_department_projects(request):
+    """
+    GET /api/tasks/departments/projects/?department=...&mode=normal|recurring|all
+    Returns project cards within a specific department.
+    """
+    dept = request.query_params.get("department", "").strip()
+    mode = request.query_params.get("mode", "all").strip().lower()
+    if not dept:
+        return Response({"detail": "Department parameter is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+    tasks_qs = Task.objects.filter(department=dept)
+    if mode == "normal":
+        tasks_qs = tasks_qs.filter(recurring_source__isnull=True)
+    elif mode == "recurring":
+        tasks_qs = tasks_qs.filter(recurring_source__isnull=False)
+
+    project_names = list(
+        tasks_qs.exclude(project_name="")
+        .values_list("project_name", flat=True)
         .distinct()
-        .order_by("department")
+        .order_by("project_name")
     )
-    return Response([{"id": name, "name": name} for name in departments])
+
+    has_unassigned = tasks_qs.filter(project_name="").exists()
+    all_projects = list(project_names)
+    if has_unassigned:
+        all_projects.append("General Tasks")
+
+    projects_data = []
+    for proj in all_projects:
+        if proj == "General Tasks":
+            p_tasks = tasks_qs.filter(project_name="")
+        else:
+            p_tasks = tasks_qs.filter(project_name=proj)
+
+        total_p = p_tasks.count()
+        completed_p = p_tasks.filter(task_status=Task.Status.COMPLETED).count()
+        review_p = p_tasks.filter(task_status=Task.Status.UNDER_REVIEW).count()
+        rework_p = p_tasks.filter(task_status=Task.Status.REWORK_NEEDED).count()
+        open_p = p_tasks.filter(task_status__in=[
+            Task.Status.NOT_STARTED,
+            Task.Status.IN_PROGRESS,
+            Task.Status.PAUSED,
+            Task.Status.ON_HOLD,
+            Task.Status.SUBMITTED,
+            Task.Status.RESUBMITTED
+        ]).count()
+
+        assignee_names = list(
+            p_tasks.exclude(assigned_to__isnull=True)
+            .values_list("assigned_to__name", flat=True)
+            .distinct()
+        )
+        admin_assignees = list(
+            p_tasks.exclude(assigned_to_admin__isnull=True)
+            .values_list("assigned_to_admin__name", flat=True)
+            .distinct()
+        )
+        all_assignees = sorted(list(set(assignee_names + admin_assignees)))
+
+        completion_rate = round((completed_p / total_p * 100), 1) if total_p > 0 else 0
+
+        projects_data.append({
+            "project_name": proj,
+            "department": dept,
+            "total_tasks": total_p,
+            "open_tasks": open_p,
+            "completed_tasks": completed_p,
+            "review_tasks": review_p,
+            "rework_tasks": rework_p,
+            "completion_rate": completion_rate,
+            "assignees": all_assignees,
+        })
+
+    return Response(projects_data)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def get_project_tasks(request):
+    """
+    GET /api/tasks/project_tasks/?project_name=...&department=...&mode=normal|recurring|all
+    Returns full task items for a specific project.
+    """
+    project_name = request.query_params.get("project_name", "").strip()
+    department = request.query_params.get("department", "").strip()
+    mode = request.query_params.get("mode", "all").strip().lower()
+
+    qs = task_list_queryset()
+    if department:
+        qs = qs.filter(department=department)
+    elif getattr(request.user, "role", None) == "employee" and getattr(request.user.instance, "department", None):
+        qs = qs.filter(department=request.user.instance.department)
+    if project_name:
+        if project_name == "General Tasks":
+            qs = qs.filter(project_name="")
+        else:
+            qs = qs.filter(project_name=project_name)
+
+    if mode == "normal":
+        qs = qs.filter(recurring_source__isnull=True)
+    elif mode == "recurring":
+        qs = qs.filter(recurring_source__isnull=False)
+
+    return Response(TaskListSerializer(qs, many=True).data)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def quick_create_task(request):
+    """
+    POST /api/tasks/quick_create/
+    Jira-style quick inline create:
+    Body: { "task_name": "...", "project_name": "...", "department": "...", "assigned_to": id, "priority": "medium", "task_status": "not_started", "due_date": "...", "allotted_time": 1.5, "reporter_type": "admin"|"tl", "reporter_id": id }
+    """
+    from django.utils import timezone
+    from accounts.models import Admin, Employee
+
+    task_name = str(request.data.get("task_name") or "").strip()
+    if not task_name:
+        return Response({"detail": "Task name is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+    project_name = str(request.data.get("project_name") or "").strip()
+    department = str(request.data.get("department") or "").strip()
+    priority = request.data.get("priority") or "medium"
+    status_val = request.data.get("task_status") or "not_started"
+    assigned_to_id = request.data.get("assigned_to")
+    due_date = request.data.get("due_date") or None
+    allotted_time = request.data.get("allotted_time") or 1.0
+
+    # Assignee: if assigned_to_id passed, use that; otherwise if regular employee, default to themselves!
+    emp = None
+    if assigned_to_id:
+        emp = Employee.objects.filter(pk=assigned_to_id).first()
+    elif not _is_admin(request):
+        emp = request.user.instance
+
+    if emp and not department:
+        department = emp.department
+
+    # Reporter resolution (can pass reporter_type + reporter_id, or "reporter": "admin_1" / "tl_3")
+    reporter_type = request.data.get("reporter_type")
+    reporter_id = request.data.get("reporter_id")
+    reporter_raw = request.data.get("reporter")
+    if reporter_raw and not reporter_type:
+        raw_str = str(reporter_raw)
+        if raw_str.startswith("admin_"):
+            reporter_type = "admin"
+            try:
+                reporter_id = int(raw_str.replace("admin_", ""))
+            except ValueError:
+                pass
+        elif raw_str.startswith("tl_") or raw_str.startswith("emp_"):
+            reporter_type = "tl"
+            try:
+                reporter_id = int(raw_str.replace("tl_", "").replace("emp_", ""))
+            except ValueError:
+                pass
+
+    assigned_by_admin = None
+    assigned_by_employee = None
+
+    if reporter_type == "admin" and reporter_id:
+        assigned_by_admin = Admin.objects.filter(pk=reporter_id).first()
+    elif reporter_type in ["tl", "employee"] and reporter_id:
+        assigned_by_employee = Employee.objects.filter(pk=reporter_id).first()
+    else:
+        # Defaults
+        if _is_admin(request):
+            assigned_by_admin = request.user.instance
+        else:
+            current_emp = request.user.instance
+            if current_emp and current_emp.belong_to_tl:
+                assigned_by_employee = current_emp.belong_to_tl
+            else:
+                assigned_by_admin = Admin.objects.first()
+
+    task = Task.objects.create(
+        task_name=task_name,
+        project_name=project_name,
+        department=department,
+        priority=priority,
+        task_status=status_val,
+        assigned_to=emp,
+        assigned_by_admin=assigned_by_admin,
+        assigned_by_employee=assigned_by_employee,
+        assigned_date=timezone.localdate(),
+        due_date=due_date,
+        allotted_time=allotted_time,
+    )
+
+    return Response(TaskListSerializer(task).data, status=status.HTTP_201_CREATED)
 
 
 @api_view(["GET"])
@@ -161,12 +420,32 @@ def get_priority_choices(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def get_all_admins(request):
-    """GET /api/tasks/get_all_admins/ — dropdown source for a TL's 'Assign to Admin' option."""
-    if not _is_tl(request):
-        return Response({"detail": "Team leads only."}, status=status.HTTP_403_FORBIDDEN)
+    """GET /api/tasks/get_all_admins/ — dropdown source for admins."""
     from accounts.models import Admin
     admins = Admin.objects.filter(is_active=True).order_by("name")
     return Response([{"id": a.id, "name": a.name} for a in admins])
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def get_all_reporters(request):
+    """
+    GET /api/tasks/get_all_reporters/
+    Returns all valid reporters (Admins).
+    """
+    from accounts.models import Admin
+    admins = Admin.objects.filter(is_active=True).order_by("name")
+
+    reporters = []
+    for a in admins:
+        reporters.append({
+            "id": a.id,
+            "name": a.name,
+            "type": "admin",
+            "role": "Administrator",
+            "label": f"{a.name} (Admin)",
+            "key": f"admin_{a.id}",
+        })
+    return Response(reporters)
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
@@ -257,6 +536,8 @@ def edit_task(request, pk):
 
         if "project_name" in data:
             task.project_name = str(data.get("project_name") or "").strip()
+        if "task_status" in data and data.get("task_status"):
+            task.task_status = data["task_status"]
         if "task_name" in data and data.get("task_name"):
             task.task_name = str(data["task_name"]).strip()
         if "task_details" in data:
@@ -267,6 +548,32 @@ def edit_task(request, pk):
                 task.department = dept_val
         if "priority" in data and data.get("priority"):
             task.priority = data["priority"]
+        if "reporter" in data or "reporter_type" in data:
+            reporter_raw = data.get("reporter")
+            reporter_type = data.get("reporter_type")
+            reporter_id = data.get("reporter_id")
+            if reporter_raw and not reporter_type:
+                raw_str = str(reporter_raw)
+                if raw_str.startswith("admin_"):
+                    reporter_type = "admin"
+                    try:
+                        reporter_id = int(raw_str.replace("admin_", ""))
+                    except ValueError:
+                        pass
+                elif raw_str.startswith("tl_") or raw_str.startswith("emp_"):
+                    reporter_type = "tl"
+                    try:
+                        reporter_id = int(raw_str.replace("tl_", "").replace("emp_", ""))
+                    except ValueError:
+                        pass
+
+            from accounts.models import Admin
+            if reporter_type == "admin" and reporter_id:
+                task.assigned_by_admin = Admin.objects.filter(pk=reporter_id).first()
+                task.assigned_by_employee = None
+            elif reporter_type in ["tl", "employee"] and reporter_id:
+                task.assigned_by_employee = Employee.objects.filter(pk=reporter_id).first()
+                task.assigned_by_admin = None
         if "start_date" in data:
             task.start_date = data["start_date"] or None
         if "due_date" in data:
@@ -330,3 +637,79 @@ def edit_task(request, pk):
         import traceback
         traceback.print_exc()
         return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+DISALLOWED_VIDEO_EXTENSIONS = {
+    ".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".m4v", ".3gp"
+}
+
+@api_view(["POST", "GET"])
+@permission_classes([IsAuthenticated])
+def task_attachments_view(request, pk):
+    """POST/GET /api/tasks/<int:pk>/attachments/"""
+    task = get_object_or_404(Task, pk=pk)
+    if request.method == "POST":
+        kind, actor = _current_task_actor(request)
+        attachment_kwargs = {"uploaded_by": actor} if kind == "employee" else {"uploaded_by_admin": actor}
+        files = request.FILES.getlist("attachments") or request.FILES.getlist("file") or request.FILES.getlist("attachment")
+        if not files:
+            return Response({"detail": "No file was uploaded."}, status=status.HTTP_400_BAD_REQUEST)
+
+        import os
+        # Reject video uploads
+        for f in files:
+            ext = os.path.splitext(f.name)[1].lower()
+            if ext in DISALLOWED_VIDEO_EXTENSIONS:
+                return Response(
+                    {"detail": f"Videos are not allowed ('{f.name}'). Only images, docx, ppt, pdf, and excel files are supported."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        created = []
+        creation_meta_list = list(task.task_creation_attachments or [])
+        try:
+            for f in files:
+                att = TaskAttachment.objects.create(task=task, file=f, is_creation_attachment=True, **attachment_kwargs)
+                created.append(att)
+                creation_meta_list.append({
+                    "id": att.id,
+                    "name": os.path.basename(att.file.name),
+                    "file": att.file.url if hasattr(att.file, "url") else str(att.file),
+                    "size": att.file.size if hasattr(att.file, "size") else 0,
+                    "uploaded_at": att.uploaded_at.isoformat(),
+                })
+        except Exception as upload_err:
+            import logging
+            logging.getLogger(__name__).error("Attachment save failed: %s", upload_err)
+            return Response({"detail": f"Failed to upload attachment: {str(upload_err)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        task.task_creation_attachments = creation_meta_list
+        task.save(update_fields=["task_creation_attachments"])
+
+        return Response(TaskAttachmentSerializer(task.attachments.all(), many=True).data, status=status.HTTP_201_CREATED)
+    return Response(TaskAttachmentSerializer(task.attachments.all(), many=True).data)
+
+
+@api_view(["POST", "GET"])
+@permission_classes([IsAuthenticated])
+def task_comments_view(request, pk):
+    """POST/GET /api/tasks/<int:pk>/comments/"""
+    task = get_object_or_404(Task, pk=pk)
+    if request.method == "POST":
+        comment_text = str(request.data.get("comment") or "").strip()
+        if not comment_text:
+            return Response({"detail": "Comment cannot be empty."}, status=status.HTTP_400_BAD_REQUEST)
+        log_activity(task, request.user, "comment", details={"comment": comment_text})
+
+    logs = ActivityLog.objects.filter(task=task).order_by("-created_at")
+    comments = []
+    for l in logs:
+        text = l.details.get("comment", "") if isinstance(l.details, dict) else ""
+        if text or l.action == "comment":
+            comments.append({
+                "id": l.id,
+                "actor": l.actor_name,
+                "text": text,
+                "created_at": l.created_at.isoformat(),
+            })
+    return Response(comments)

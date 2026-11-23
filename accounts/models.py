@@ -4,6 +4,17 @@ from django.contrib.auth.hashers import make_password, check_password
 import secrets
 
 
+class Department(models.Model):
+    name = models.CharField(max_length=100, unique=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+
 class Admin(models.Model):
     name = models.CharField(max_length=150)
     email = models.EmailField(unique=True)

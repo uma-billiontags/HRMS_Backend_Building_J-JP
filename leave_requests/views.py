@@ -59,10 +59,7 @@ def _parse_and_validate_emails(raw_val, field_name="recipient email", required=F
 
 
 def _is_tl(request):
-    return (
-        getattr(request.user, "role", None) == "employee"
-        and getattr(request.user.instance, "role", "") in ("TL", "Team Lead")
-    )
+    return False
 
 
 def _serialize(item):
@@ -245,16 +242,6 @@ def create_request(request):
             sender_name=sender_name,
         )
 
-    if hasattr(request.user, "instance") and getattr(request.user.instance, "belong_to_tl", None):
-        send_notification(
-            recipient=request.user.instance.belong_to_tl,
-            title="Team Member Request",
-            message=f"{sender_name} submitted a new {req_type}: '{item.subject}'.",
-            event_type=Notification.EventType.REQUEST_CREATED,
-            action_url="/employee/requests",
-            sender_name=sender_name,
-        )
-
     return Response(_serialize(item), status=status.HTTP_201_CREATED)
 
 
@@ -262,15 +249,10 @@ def create_request(request):
 @permission_classes([IsAuthenticated])
 def admin_requests(request):
     is_admin = getattr(request.user, "role", None) == "admin"
-    is_tl = _is_tl(request)
-    if not (is_admin or is_tl):
-        return Response({"detail": "Admin or Team Lead access only."}, status=status.HTTP_403_FORBIDDEN)
+    if not is_admin:
+        return Response({"detail": "Admin access only."}, status=status.HTTP_403_FORBIDDEN)
 
     rows = EmployeeRequest.objects.select_related("employee", "decided_by_admin", "decided_by_employee")
-    if is_tl and not is_admin:
-        # TL receives requests ONLY from employees who belong to THIS TL
-        rows = rows.filter(employee__belong_to_tl=request.user.instance)
-
     status_filter = request.query_params.get("status")
     if status_filter in EmployeeRequest.Status.values:
         rows = rows.filter(status=status_filter)
@@ -361,9 +343,8 @@ def _send_decision_email(item, decision, decision_note=""):
 @permission_classes([IsAuthenticated])
 def admin_decide_request(request, pk):
     is_admin = getattr(request.user, "role", None) == "admin"
-    is_tl = _is_tl(request)
-    if not (is_admin or is_tl):
-        return Response({"detail": "Admin or Team Lead access only."}, status=status.HTTP_403_FORBIDDEN)
+    if not is_admin:
+        return Response({"detail": "Admin access only."}, status=status.HTTP_403_FORBIDDEN)
 
     decision = request.data.get("decision")
     if decision not in ("approved", "rejected"):
@@ -378,18 +359,8 @@ def admin_decide_request(request, pk):
         if item.status != EmployeeRequest.Status.PENDING:
             return Response({"detail": "This request has already been decided."}, status=status.HTTP_409_CONFLICT)
         
-        if is_tl and not is_admin:
-            if item.employee_id == request.user.instance.id:
-                return Response({"detail": "You cannot decide on your own request."}, status=status.HTTP_403_FORBIDDEN)
-            if item.employee and item.employee.role in ("TL", "Team Lead"):
-                return Response({"detail": "Team Lead requests must be decided by an Administrator."}, status=status.HTTP_403_FORBIDDEN)
-            if item.employee and item.employee.belong_to_tl_id != request.user.instance.id:
-                return Response({"detail": "You can only decide requests for your team members."}, status=status.HTTP_403_FORBIDDEN)
-            item.decided_by_employee = request.user.instance
-            item.decided_by_admin = None
-        elif is_admin:
-            item.decided_by_admin = request.user.instance
-            item.decided_by_employee = None
+        item.decided_by_admin = request.user.instance
+        item.decided_by_employee = None
 
         item.status = decision
         item.decision_note = decision_note

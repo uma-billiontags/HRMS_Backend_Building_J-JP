@@ -41,8 +41,7 @@ def _current_admin(request):
 
 
 def _is_tl(request):
-    emp = _current_employee(request)
-    return emp is not None and getattr(emp, "role", "") in ("TL", "Team Lead")
+    return False
 
 
 @api_view(["GET"])
@@ -844,26 +843,14 @@ def decide_attendance_correction(request, pk):
     POST /api/attendance/corrections/<pk>/decision/
     Body: { "decision": "approve" | "reject", "admin_notes": "..." }
     """
-    is_admin = _is_admin(request)
-    is_tl = _is_tl(request)
-    if not (is_admin or is_tl):
-        return Response({"detail": "Admin or Team Lead access only."}, status=status.HTTP_403_FORBIDDEN)
+    if not _is_admin(request):
+        return Response({"detail": "Admin access only."}, status=status.HTTP_403_FORBIDDEN)
 
     correction = get_object_or_404(AttendanceCorrectionRequest, pk=pk)
     if correction.status != AttendanceCorrectionRequest.Status.PENDING:
         return Response({"detail": "This request has already been decided."}, status=status.HTTP_400_BAD_REQUEST)
 
-    emp_user = _current_employee(request)
     admin_user = _current_admin(request)
-
-    # Security check: TL cannot decide on their own request or another TL's request
-    if is_tl and not is_admin:
-        if correction.employee_id == emp_user.id:
-            return Response({"detail": "You cannot decide on your own correction request. It must be approved by an Administrator."}, status=status.HTTP_403_FORBIDDEN)
-        if correction.employee and correction.employee.role in ("TL", "Team Lead"):
-            return Response({"detail": "Team Lead correction requests must be decided by an Administrator."}, status=status.HTTP_403_FORBIDDEN)
-        if correction.employee and correction.employee.belong_to_tl_id != emp_user.id:
-            return Response({"detail": "You can only decide correction requests for your team members."}, status=status.HTTP_403_FORBIDDEN)
 
     decision = request.data.get("decision")
     admin_notes = request.data.get("admin_notes", "").strip()
@@ -1013,14 +1000,9 @@ def list_attendance_corrections(request):
     Employee gets their own requests.
     """
     qs = AttendanceCorrectionRequest.objects.all().select_related("employee", "admin", "decided_by", "decided_by_employee", "attendance")
-    view_type = request.query_params.get("view")
 
     if _is_admin(request):
         pass
-    elif _is_tl(request) and view_type == "team":
-        emp = _current_employee(request)
-        # Show requests ONLY from employees who belong to THIS TL
-        qs = qs.filter(employee__belong_to_tl=emp)
     else:
         emp = _current_employee(request)
         adm = _current_admin(request)
