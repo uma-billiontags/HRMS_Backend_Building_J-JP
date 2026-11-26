@@ -102,7 +102,7 @@ def get_all_employee_credentials(request):
     """GET /api/auth/employees/ — Team Access list. Admin-only."""
     if not _is_admin(request):
         return Response({"detail": "Admin only."}, status=status.HTTP_403_FORBIDDEN)
-    employees = Employee.objects.select_related("belong_to_tl").all().order_by("name")
+    employees = Employee.objects.select_related("belong_to_admin", "belong_to_tl").all().order_by("name")
     return Response(EmployeeCredentialSerializer(employees, many=True).data)
 
 
@@ -222,8 +222,11 @@ def bulk_create_employees(request):
     existing_admin_emails = set(Admin.objects.values_list("email", flat=True))
     existing_ids = set(Employee.objects.exclude(employee_id__isnull=True).exclude(employee_id="").values_list("employee_id", flat=True))
 
-    # All team members report directly to Admin
-    belong_to_tl = None
+    admin_lookup = {}
+    for adm in Admin.objects.all():
+        admin_lookup[str(adm.id)] = adm
+        admin_lookup[adm.name.lower()] = adm
+        admin_lookup[adm.email.lower()] = adm
 
     seen_emails_in_batch = set()
     seen_ids_in_batch = set()
@@ -283,12 +286,22 @@ def bulk_create_employees(request):
         if not password:
             password = f"Welcome@{emp_id}"
 
+        target_admin = None
+        raw_rep = item.get("reporting_to") or item.get("belong_to_admin") or item.get("belong_to_tl")
+        if raw_rep:
+            raw_str = str(raw_rep).strip().lower()
+            if raw_str.startswith("admin_"):
+                raw_str = raw_str.replace("admin_", "")
+            if raw_str in admin_lookup:
+                target_admin = admin_lookup[raw_str]
+
         emp = Employee(
             employee_id=emp_id,
             name=name,
             email=email,
             department=department,
             role=role,
+            belong_to_admin=target_admin,
             belong_to_tl=None,
             is_active=bool(is_active),
         )

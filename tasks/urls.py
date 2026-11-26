@@ -10,6 +10,7 @@ urlpatterns = [
     path("create_and_assign/", views.create_and_assign_task, name="task-create-assign"),
     path("<int:pk>/edit/", views.edit_task, name="task-edit"),
     path("<int:pk>/attachments/", views.task_attachments_view, name="task-attachments"),
+    path("<int:pk>/attachments/<int:att_id>/download/", views.download_task_attachment, name="attachment-download"),
     path("<int:pk>/comments/", views.task_comments_view, name="task-comments"),
     path("assign_task/<int:pk>/", views.assign_task, name="task-assign"),
 
@@ -74,6 +75,7 @@ urlpatterns = [
     path("recurring/", views.get_recurring_tasks, name="recurring-list"),
     path("recurring/mine/", views.get_my_recurring_tasks, name="recurring-mine"),   # ← ADDED
     path("recurring/create/", views.create_recurring_task, name="recurring-create"),
+    path("recurring/<int:pk>/", views.recurring_task_detail, name="recurring-detail"),
     path("recurring/<int:pk>/stop/", views.stop_recurring_task, name="recurring-stop"),
     path("recurring/<int:pk>/toggle_date/", views.toggle_recurring_date, name="recurring-toggle-date"),  # <-- ADD THIS
     path("recurring/assigned_to_me/", views.get_assigned_recurring_tasks, name="recurring-assigned-to-me"),

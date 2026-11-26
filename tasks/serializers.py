@@ -4,15 +4,17 @@ from rest_framework import serializers
 from .models import Task, TimerSession, TaskMaster, RecurringTaskDefinition, TaskAttachment, CorrectionRequest, Notification
 from django.core.validators import URLValidator
 from django.core.exceptions import ValidationError as DjangoValidationError
+from django.utils import timezone
 
 
 class TaskAttachmentSerializer(serializers.ModelSerializer):
     name = serializers.SerializerMethodField()
     size = serializers.SerializerMethodField()
+    file = serializers.SerializerMethodField()
 
     class Meta:
         model = TaskAttachment
-        fields = ["id", "file", "name", "size", "uploaded_at"]
+        fields = ["id", "file", "name", "size", "uploaded_at", "uploaded_by", "uploaded_by_admin", "is_creation_attachment"]
 
     def get_name(self, obj):
         import os
@@ -20,9 +22,29 @@ class TaskAttachmentSerializer(serializers.ModelSerializer):
 
     def get_size(self, obj):
         try:
+            if not obj.file:
+                return 0
+            import os
+            from django.conf import settings
+            local_path = os.path.join(settings.MEDIA_ROOT, obj.file.name)
+            if os.path.exists(local_path):
+                return os.path.getsize(local_path)
             return obj.file.size
         except Exception:
             return 0
+
+    def get_file(self, obj):
+        if not obj.file:
+            return ""
+        import os
+        from django.conf import settings
+        local_path = os.path.join(settings.MEDIA_ROOT, obj.file.name)
+        if os.path.exists(local_path):
+            return f"{settings.MEDIA_URL}{obj.file.name}"
+        try:
+            return obj.file.url
+        except Exception:
+            return f"{settings.MEDIA_URL}{obj.file.name}"
 
 
 class TaskListSerializer(serializers.ModelSerializer):
@@ -52,6 +74,7 @@ class TaskListSerializer(serializers.ModelSerializer):
             "id", "task_id", "sub_task_id", "department", "project_name", "task_name", "task_details",
             "assigned_to", "assigned_to_admin", "assigned_to_name", "assignee_role", "department_name",
             "assigned_by_name", "assigned_by_admin", "assigned_by_employee", "reporter_key",
+            "created_by_admin", "created_by_employee",
             "priority", "start_date", "assigned_date", "due_date", "due_time", "allotted_time",
             "task_status", "total_time_taken", "remaining_or_over_time",
             "task_sheet_link", "employee_remarks", "submitted_date",
@@ -123,7 +146,7 @@ class TaskAssignSerializer(serializers.ModelSerializer):
     """
     class Meta:
         model = Task
-        fields = ["assigned_to", "assigned_to_admin", "priority", "start_date", "due_date", "allotted_time"]
+        fields = ["assigned_to", "assigned_to_admin", "priority", "start_date", "due_date", "due_time", "allotted_time"]
         extra_kwargs = {
             "assigned_to": {"required": False},
             "assigned_to_admin": {"required": False},
@@ -216,15 +239,29 @@ class TaskCreateAssignSerializer(serializers.ModelSerializer):
         model = Task
         fields = [
             "project_name", "task_name", "task_details", "department",
-            "assigned_to", "assigned_to_admin", "priority", "due_date", "due_time", "allotted_time",
+            "assigned_to", "assigned_to_admin", "priority", "start_date", "due_date", "due_time", "allotted_time",
         ]
         extra_kwargs = {
             "assigned_to": {"required": False},
             "assigned_to_admin": {"required": False},
             "priority": {"required": True},
+            "start_date": {"required": False},
             "due_date": {"required": True},
             "allotted_time": {"required": True},
         }
+
+    def to_internal_value(self, data):
+        mutable_data = data.copy() if hasattr(data, "copy") else dict(data)
+        if ("allotted_hours" in mutable_data or "allotted_minutes" in mutable_data) and "allotted_time" not in mutable_data:
+            h = float(mutable_data.get("allotted_hours") or 0)
+            m = float(mutable_data.get("allotted_minutes") or 0)
+            mutable_data["allotted_time"] = round(h + (m / 60.0), 2)
+        if "due_time" in mutable_data and mutable_data["due_time"]:
+            from .views.task_views import parse_due_time
+            parsed_time = parse_due_time(mutable_data["due_time"])
+            if parsed_time:
+                mutable_data["due_time"] = parsed_time
+        return super().to_internal_value(mutable_data)
 
     def validate_task_name(self, value):
         if not value.strip():
@@ -322,7 +359,7 @@ class RecurringTaskDefinitionSerializer(serializers.ModelSerializer):
     class Meta:
         model = RecurringTaskDefinition
         fields = [
-            "id", "project_name", "task_name", "task_details",
+            "id", "project_name", "department", "task_name", "task_details",
             "assigned_to", "assigned_to_admin", "assigned_to_name", "assignee_role",  # CHANGED
             "priority", "allotted_time", "frequency", "start_date", "end_date", "weekdays",
             "excluded_dates",  # <-- ADD THIS
@@ -346,12 +383,13 @@ class RecurringTaskDefinitionCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = RecurringTaskDefinition
         fields = [
-            "project_name", "task_name", "task_details", "assigned_to", "assigned_to_admin",  # CHANGED
+            "project_name", "department", "task_name", "task_details", "assigned_to", "assigned_to_admin",  # CHANGED
             "priority", "allotted_time", "start_date", "end_date", "weekdays",
         ]
         extra_kwargs = {
             "project_name": {"required": False},   # optional, matches Task.project_name being blank=True
-            "assigned_to": {"required": False},        # CHANGED — was required=True
+            "department": {"required": False},
+            "assigned_to": {"required": False},
             "assigned_to_admin": {"required": False},   # NEW
             "priority": {"required": True},
             "allotted_time": {"required": True},
@@ -364,16 +402,16 @@ class RecurringTaskDefinitionCreateSerializer(serializers.ModelSerializer):
         return value
 
     def validate(self, attrs):
-        end_date = attrs.get("end_date")
-        start_date = attrs.get("start_date")
+        end_date = attrs.get("end_date", getattr(self.instance, "end_date", None))
+        start_date = attrs.get("start_date", getattr(self.instance, "start_date", None))
+        if "start_date" in attrs and start_date < timezone.localdate():
+            raise serializers.ValidationError({"start_date": "Start date cannot be before today."})
         if end_date and start_date and end_date < start_date:
             raise serializers.ValidationError({"end_date": "End date can't be before start date."})
 
-        # NEW — same exactly-one-of pattern as TaskAssignSerializer
+        # Recurring rules may be unassigned until the admin fills in the schedule.
         assigned_to = attrs.get("assigned_to")
         assigned_to_admin = attrs.get("assigned_to_admin")
-        if not assigned_to and not assigned_to_admin:
-            raise serializers.ValidationError("Assign this recurring task to either an employee or an admin.")
         if assigned_to and assigned_to_admin:
             raise serializers.ValidationError("Assign to either an employee or an admin, not both.")
         return attrs

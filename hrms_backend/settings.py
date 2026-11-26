@@ -26,7 +26,7 @@ SECRET_KEY = os.environ.get(
 )
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = os.environ.get('DEBUG', 'False') == 'True'
+DEBUG = os.environ.get('DEBUG', 'False').strip().rstrip('.').lower() in ('true', '1')
 
 # Wide open — fine while you're bouncing between Render/Railway/Vercel and
 # don't yet have a fixed final domain. Tighten this once you settle on one.
@@ -209,20 +209,30 @@ MEDIA_ROOT = BASE_DIR / 'media'
 USE_S3_STORAGE = os.getenv("USE_S3_STORAGE", "False").lower() in ("true", "1")
 
 if USE_S3_STORAGE:
-    # Resolve Supabase domains directly to Cloudflare Anycast IP to prevent
-    # ISP DNS poisoning / IT Act block page (e.g. 202.83.24.75) on local development networks.
-    import socket
-    _orig_getaddrinfo = socket.getaddrinfo
+    # Optional DNS resolver override if explicitly configured
+    _resolver_ip = os.getenv("SUPABASE_RESOLVER_IP", "").strip()
+    if _resolver_ip:
+        import socket
+        _orig_getaddrinfo = socket.getaddrinfo
 
-    def _supabase_dns_resolver(host, port, *args, **kwargs):
-        if isinstance(host, str) and (host.endswith(".supabase.co") or host == "supabase.co"):
-            return _orig_getaddrinfo("104.18.38.10", port, *args, **kwargs)
-        return _orig_getaddrinfo(host, port, *args, **kwargs)
+        def _supabase_dns_resolver(host, port, *args, **kwargs):
+            if isinstance(host, str) and (host.endswith(".supabase.co") or host == "supabase.co"):
+                return _orig_getaddrinfo(_resolver_ip, port, *args, **kwargs)
+            return _orig_getaddrinfo(host, port, *args, **kwargs)
 
-    socket.getaddrinfo = _supabase_dns_resolver
+        socket.getaddrinfo = _supabase_dns_resolver
 
     _supabase_project_id = os.getenv("SUPABASE_PROJECT_ID", "")
     _supabase_bucket = os.getenv("SUPABASE_STORAGE_BUCKET", "hrms-media")
+    _supabase_region = os.getenv("SUPABASE_STORAGE_REGION", "ap-southeast-2")
+
+    from botocore.config import Config
+    _s3_config = Config(
+        connect_timeout=3,
+        read_timeout=5,
+        retries={"max_attempts": 1},
+    )
+
     STORAGES = {
         "default": {
             "BACKEND": "storages.backends.s3.S3Storage",
@@ -230,12 +240,13 @@ if USE_S3_STORAGE:
                 "access_key": os.getenv("SUPABASE_STORAGE_ACCESS_KEY"),
                 "secret_key": os.getenv("SUPABASE_STORAGE_SECRET_KEY"),
                 "bucket_name": _supabase_bucket,
-                "region_name": os.getenv("SUPABASE_STORAGE_REGION", "ap-southeast-1"),
+                "region_name": _supabase_region,
                 "endpoint_url": f"https://{_supabase_project_id}.supabase.co/storage/v1/s3",
                 "default_acl": None,  # Supabase S3 does not support object ACLs
                 "querystring_auth": False,  # Generates clean, permanent public URLs without expiring tokens
                 "addressing_style": "path",  # Required for Supabase S3 compatibility
                 "custom_domain": f"{_supabase_project_id}.supabase.co/storage/v1/object/public/{_supabase_bucket}",
+                "client_config": _s3_config,
             },
         },
         "staticfiles": {

@@ -3,7 +3,7 @@
 from .task_views import (
     create_task, assign_task, edit_task, create_and_assign_task, get_all_departments,
     get_departments_overview, get_department_projects, get_project_tasks, quick_create_task,
-    task_attachments_view, task_comments_view,
+    task_attachments_view, task_comments_view, download_task_attachment,
     get_all_employees, get_priority_choices, get_all_admins, get_admin_my_tasks,
     get_all_reporters,
     task_master_view, task_master_detail_view
@@ -33,7 +33,8 @@ from .report_views import (
 
 from .recurring import (
     get_recurring_tasks, create_recurring_task, stop_recurring_task, generate_recurring_tasks, get_all_tasks,
-    get_my_tasks, get_tl_tasks, get_my_recurring_tasks, toggle_recurring_date, get_assigned_recurring_tasks
+    get_my_tasks, get_tl_tasks, get_my_recurring_tasks, toggle_recurring_date, get_assigned_recurring_tasks,
+    recurring_task_detail
 )
 
 from .notification_views import (

@@ -35,27 +35,39 @@ class AdminSerializer(serializers.ModelSerializer):
 
 
 class EmployeeSerializer(serializers.ModelSerializer):
+    belong_to_admin_name = serializers.CharField(source="belong_to_admin.name", read_only=True, default=None)
+    belong_to_admin_email = serializers.CharField(source="belong_to_admin.email", read_only=True, default=None)
     belong_to_tl_name = serializers.CharField(source="belong_to_tl.name", read_only=True, default=None)
 
     class Meta:
         model = Employee
-        fields = ["id", "name", "email", "department", "role", "belong_to_tl", "belong_to_tl_name"]
+        fields = [
+            "id", "name", "email", "department", "role",
+            "belong_to_admin", "belong_to_admin_name", "belong_to_admin_email",
+            "belong_to_tl", "belong_to_tl_name"
+        ]
         
 
 class EmployeeCredentialSerializer(serializers.ModelSerializer):
     """Used by the Team Access list/table — includes the password for viewing."""
+    belong_to_admin_name = serializers.CharField(source="belong_to_admin.name", read_only=True, default=None)
+    belong_to_admin_email = serializers.CharField(source="belong_to_admin.email", read_only=True, default=None)
     belong_to_tl_name = serializers.CharField(source="belong_to_tl.name", read_only=True, default=None)
 
     class Meta:
         model = Employee
         fields = [
             "id", "employee_id", "name", "email", "password", "department",
-            "role", "belong_to_tl", "belong_to_tl_name", "is_active", "created_at"
+            "role", "belong_to_admin", "belong_to_admin_name", "belong_to_admin_email",
+            "belong_to_tl", "belong_to_tl_name", "is_active", "created_at"
         ]
 
 
 class EmployeeWriteSerializer(serializers.ModelSerializer):
     password = serializers.CharField(required=False, allow_blank=True)
+    belong_to_admin = serializers.PrimaryKeyRelatedField(
+        queryset=Admin.objects.all(), required=False, allow_null=True
+    )
     belong_to_tl = serializers.PrimaryKeyRelatedField(
         queryset=Employee.objects.all(), required=False, allow_null=True
     )
@@ -64,7 +76,7 @@ class EmployeeWriteSerializer(serializers.ModelSerializer):
         model = Employee
         fields = [
             "id", "employee_id", "name", "email", "password",
-            "department", "role", "belong_to_tl", "is_active"
+            "department", "role", "belong_to_admin", "belong_to_tl", "is_active"
         ]
         extra_kwargs = {
             "name": {"required": True},
@@ -99,6 +111,28 @@ class EmployeeWriteSerializer(serializers.ModelSerializer):
         if Admin.objects.filter(email__iexact=value).exists():
             raise serializers.ValidationError("This email is already registered as an Admin.")
         return value
+
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, "copy") else dict(data)
+        # Check both belong_to_admin and belong_to_tl for admin identifier
+        admin_val = data.get("belong_to_admin")
+        if admin_val is None and "belong_to_tl" in data:
+            admin_val = data.get("belong_to_tl")
+
+        if admin_val is not None:
+            if isinstance(admin_val, str):
+                if admin_val.startswith("admin_"):
+                    data["belong_to_admin"] = int(admin_val.replace("admin_", ""))
+                elif admin_val.isdigit():
+                    data["belong_to_admin"] = int(admin_val)
+                elif admin_val in ("ADMIN", "0", ""):
+                    data["belong_to_admin"] = None
+            elif isinstance(admin_val, int):
+                data["belong_to_admin"] = admin_val
+
+        # Always null out legacy belong_to_tl
+        data["belong_to_tl"] = None
+        return super().to_internal_value(data)
 
     def validate(self, attrs):
         if self.instance is None and not attrs.get("password"):

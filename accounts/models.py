@@ -44,6 +44,14 @@ class Employee(models.Model):
     employee_id = models.CharField(max_length=50, unique=True, blank=True, null=True)  # NEW — manually entered by admin
     department = models.CharField(max_length=100, blank=True)
     role = models.CharField(max_length=100, blank=True)   # e.g. "Team Lead", "Developer"
+    belong_to_admin = models.ForeignKey(
+        Admin,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="employees",
+        help_text="The Admin this employee reports to.",
+    )
     belong_to_tl = models.ForeignKey(
         "self",
         null=True,

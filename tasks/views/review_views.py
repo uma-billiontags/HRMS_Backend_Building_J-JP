@@ -49,6 +49,9 @@ def start_review(request, pk):
     if not _can_review_task(request, task):
         return Response({"detail": "You can't review this task."}, status=status.HTTP_403_FORBIDDEN)
 
+    if task.task_status == Task.Status.UNDER_REVIEW:
+        return Response(TaskListSerializer(task).data)
+
     if task.task_status not in (Task.Status.SUBMITTED, Task.Status.RESUBMITTED):
         return Response(
             {"detail": "Only submitted or resubmitted tasks can enter review."},

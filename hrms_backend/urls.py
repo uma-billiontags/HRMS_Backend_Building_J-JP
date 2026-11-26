@@ -14,7 +14,19 @@ urlpatterns = [
     path("api/requests/", include("leave_requests.urls")),
 ]
 
+import os
+from django.views.static import serve
+
+
+def serve_media_with_download(request, path):
+    response = serve(request, path, document_root=settings.MEDIA_ROOT)
+    if request.GET.get("download") == "1":
+        clean_name = os.path.basename(path)
+        response["Content-Disposition"] = f'attachment; filename="{clean_name}"'
+    return response
+
+
 # Serve media files in BOTH development and production
 urlpatterns += [
-    re_path(r'^media/(?P<path>.*)$', serve, {'document_root': settings.MEDIA_ROOT}),
+    re_path(r'^media/(?P<path>.*)$', serve_media_with_download),
 ]

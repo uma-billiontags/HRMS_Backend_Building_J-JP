@@ -53,9 +53,9 @@ class Task(models.Model):
     class Quality(models.TextChoices):
         EXCELLENT = "excellent", "Excellent"
         GOOD = "good", "Good"
-        NEEDS_IMPROVEMENT = "needs_improvement", "Needs Improvement"
-        REWORK_NEEDED = "rework_needed", "Rework Needed"
-        REJECTED = "rejected", "Rejected"
+        NEEDS_IMPROVEMENT = "needs_improvement", "Satisfactory"
+        REWORK_NEEDED = "rework_needed", "Below Expectations"
+        REJECTED = "rejected", "Unsatisfactory"
 
     # ── System-generated identifier, e.g. "TASK-001" ──────────────────────
     task_id = models.CharField(max_length=20, unique=True, editable=False, blank=True)
@@ -88,6 +88,12 @@ class Task(models.Model):
         Employee, null=True, blank=True, on_delete=models.PROTECT, related_name="tasks_created_as_tl",
         help_text="Set when a TL creates the task instead of an Admin.",
     )
+    created_by_admin = models.ForeignKey(
+        Admin, null=True, blank=True, on_delete=models.SET_NULL, related_name="tasks_authored",
+    )
+    created_by_employee = models.ForeignKey(
+        Employee, null=True, blank=True, on_delete=models.SET_NULL, related_name="tasks_authored_as_employee",
+    )
     
     priority = models.CharField(max_length=10, choices=Priority.choices, default=Priority.MEDIUM)
     start_date = models.DateField(null=True, blank=True, help_text="Date when task becomes active")  # <-- ADD THIS
@@ -96,7 +102,7 @@ class Task(models.Model):
     due_time = models.TimeField(null=True, blank=True, help_text="Deadline time (e.g. 15:00:00)")
 
     allotted_time = models.DecimalField(
-        max_digits=6, decimal_places=2, null=True, blank=True,
+        max_digits=8, decimal_places=2, null=True, blank=True,
         help_text="Allotted time in hours",
     )
 
@@ -188,9 +194,16 @@ class Task(models.Model):
 
         update_fields = []
 
-        # 1. Global Task ID: TASK-1, TASK-2, TASK-3
+        # Separate monotonically increasing IDs for normal and generated recurring tasks.
         if not self.task_id:
-            self.task_id = f"TASK-{self.pk}"
+            id_prefix = "RTASK" if self.recurring_source_id else "NTASK"
+            existing_ids = Task.objects.filter(task_id__startswith=f"{id_prefix}-").values_list("task_id", flat=True)
+            highest_id = 0
+            for existing_id in existing_ids:
+                match = re.fullmatch(rf"{id_prefix}-(\d+)", existing_id)
+                if match:
+                    highest_id = max(highest_id, int(match.group(1)))
+            self.task_id = f"{id_prefix}-{highest_id + 1}"
             update_fields.append("task_id")
 
         # Admin tasks must have no department
@@ -215,10 +228,13 @@ class Task(models.Model):
                 prefix = get_department_prefix(self.department)
 
             if prefix:
-                # Find the highest existing sequence number for this prefix
+                # Normal and recurring tasks have independent department sequences.
+                task_type_qs = Task.objects.filter(
+                    recurring_source__isnull=self.recurring_source_id is None,
+                    sub_task_id__startswith=f"{prefix}-",
+                )
                 last_task = (
-                    Task.objects
-                    .filter(sub_task_id__startswith=f"{prefix}-")
+                    task_type_qs
                     .exclude(pk=self.pk)
                     .order_by("-id")
                     .first()
@@ -268,9 +284,9 @@ class Task(models.Model):
 
     @property
     def created_by_role(self):
-        if self.assigned_by_admin_id:
+        if self.created_by_admin_id or (not self.created_by_employee_id and self.assigned_by_admin_id):
             return "admin"
-        if self.assigned_by_employee_id:
+        if self.created_by_employee_id or self.assigned_by_employee_id:
             return "tl"
         return None
     
@@ -442,6 +458,7 @@ class RecurringTaskDefinition(models.Model):
         DAILY = "daily", "Daily"   # room to add WEEKLY/WEEKDAYS_ONLY later
 
     project_name = models.CharField(max_length=255, blank=True)   # NEW
+    department = models.CharField(max_length=100, blank=True)
     task_name = models.CharField(max_length=255)
     task_details = models.TextField(blank=True)
     
@@ -457,7 +474,7 @@ class RecurringTaskDefinition(models.Model):
     )
     
     priority = models.CharField(max_length=10, choices=Task.Priority.choices, default=Task.Priority.MEDIUM)
-    allotted_time = models.DecimalField(max_digits=6, decimal_places=2)
+    allotted_time = models.DecimalField(max_digits=8, decimal_places=2)
 
     frequency = models.CharField(max_length=10, choices=Frequency.choices, default=Frequency.DAILY)
     weekdays = models.JSONField(

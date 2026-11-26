@@ -1,6 +1,9 @@
 # Timer Flow
 # Employee start/pause/resume/submit cycle.
 
+import os
+import json
+
 from django.shortcuts import get_object_or_404
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
@@ -73,6 +76,12 @@ def _get_task_owner_filter(request, task, kind, actor):
     return {"employee": actor} if kind == "employee" else {"admin": actor}
 
 
+def _lock_timer_owner(owner_filter):
+    """Serialize timer starts for the same employee/admin, including concurrent requests."""
+    owner = next(iter(owner_filter.values()))
+    owner.__class__.objects.select_for_update().get(pk=owner.pk)
+
+
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def start_task(request, pk):
@@ -89,6 +98,7 @@ def start_task(request, pk):
 
     with transaction.atomic():
         owner_filter = _get_task_owner_filter(request, task, kind, actor)
+        _lock_timer_owner(owner_filter)
         
         # ✅ FIX: Exclude THIS task so an orphaned session on the same task doesn't block it
         if TimerSession.objects.select_for_update().filter(end_time__isnull=True, **owner_filter).exclude(task=task).exists():
@@ -194,13 +204,22 @@ def resume_task(request, pk):
     if not (_is_admin(request) or _is_task_assignee(request, task)):
         return Response({"detail": "This task isn't assigned to you."}, status=status.HTTP_403_FORBIDDEN)
 
-    if task.task_status not in (Task.Status.PAUSED, Task.Status.REWORK_NEEDED):
-        return Response({"detail": "This task isn't paused or awaiting rework, so it can't be resumed."}, status=status.HTTP_400_BAD_REQUEST)
+    if task.task_status not in (Task.Status.PAUSED, Task.Status.REWORK_NEEDED, Task.Status.IN_PROGRESS):
+        return Response({"detail": "This task isn't paused or in progress, so it can't be resumed."}, status=status.HTTP_400_BAD_REQUEST)
 
     with transaction.atomic():
         owner_filter = _get_task_owner_filter(request, task, kind, actor)
+        _lock_timer_owner(owner_filter)
         if TimerSession.objects.select_for_update().filter(end_time__isnull=True, **owner_filter).exclude(task=task).exists():
             return Response({"detail": "You already have an active timer running on another task. Pause or submit it first."}, status=status.HTTP_409_CONFLICT)
+
+        if task.task_status == Task.Status.IN_PROGRESS and TimerSession.objects.filter(
+            task=task, end_time__isnull=True, **owner_filter
+        ).exists():
+            return Response({"detail": "This task's timer is already running."}, status=status.HTTP_409_CONFLICT)
+
+        # Clear orphaned sessions before opening the resumed session.
+        task.sessions.filter(end_time__isnull=True).update(end_time=timezone_now())
         
         # Close any open pause logs for this task
         open_pauses = TaskPauseLog.objects.filter(task=task, end_time__isnull=True)
@@ -239,8 +258,34 @@ def submit_task(request, pk):
     if not (_is_admin(request) or _is_task_assignee(request, task)):
         return Response({"detail": "This task isn't assigned to you."}, status=status.HTTP_403_FORBIDDEN)
 
-    if task.task_status not in (Task.Status.IN_PROGRESS, Task.Status.PAUSED, Task.Status.NOT_STARTED):
+    resubmission_statuses = (Task.Status.SUBMITTED, Task.Status.UNDER_REVIEW, Task.Status.RESUBMITTED)
+    is_resubmission = task.task_status in resubmission_statuses
+    if not is_resubmission and task.task_status not in (Task.Status.IN_PROGRESS, Task.Status.PAUSED, Task.Status.NOT_STARTED):
         return Response({"detail": "This task must be in progress or paused to submit it."}, status=status.HTTP_400_BAD_REQUEST)
+
+    raw_delete_ids = request.data.get("delete_attachment_ids", "[]")
+    try:
+        parsed_delete_ids = json.loads(raw_delete_ids) if isinstance(raw_delete_ids, str) else raw_delete_ids
+        if not isinstance(parsed_delete_ids, list):
+            raise ValueError
+        delete_attachment_ids = sorted({int(attachment_id) for attachment_id in parsed_delete_ids})
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return Response({"detail": "Invalid attachment deletion list."}, status=status.HTTP_400_BAD_REQUEST)
+
+    attachments_to_delete = []
+    if delete_attachment_ids:
+        removable = TaskAttachment.objects.filter(
+            task=task,
+            pk__in=delete_attachment_ids,
+            is_creation_attachment=False,
+        )
+        if kind == "employee":
+            removable = removable.filter(uploaded_by=actor)
+        else:
+            removable = removable.filter(uploaded_by_admin=actor)
+        attachments_to_delete = list(removable)
+        if len(attachments_to_delete) != len(delete_attachment_ids):
+            return Response({"detail": "You can only remove attachments you uploaded."}, status=status.HTTP_403_FORBIDDEN)
 
     task_sheet_link = request.data.get("task_sheet_link", "").strip()
     employee_remarks = request.data.get("employee_remarks", "").strip()
@@ -259,10 +304,17 @@ def submit_task(request, pk):
         task.task_sheet_link = task_sheet_link
         task.employee_remarks = employee_remarks
         task.submitted_date = timezone_now()
-        task.task_status = Task.Status.RESUBMITTED if task.rework_count > 0 else Task.Status.SUBMITTED
+        task.task_status = Task.Status.RESUBMITTED if is_resubmission or task.rework_count > 0 else Task.Status.SUBMITTED
         task.save(update_fields=["task_sheet_link", "employee_remarks", "submitted_date", "task_status"])
 
         attachment_kwargs = {"uploaded_by": actor} if kind == "employee" else {"uploaded_by_admin": actor}
+        from django.conf import settings
+        from django.core.files.storage import FileSystemStorage
+        from django.core.files.storage import default_storage
+        import datetime
+        from django.core.files.base import ContentFile
+        local_fs = FileSystemStorage(location=settings.MEDIA_ROOT, base_url=settings.MEDIA_URL)
+
         for f in request.FILES.getlist("attachments"):
             ext = os.path.splitext(f.name)[1].lower() if hasattr(f, "name") else ""
             if ext in {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".m4v", ".3gp"}:
@@ -270,7 +322,39 @@ def submit_task(request, pk):
                     {"detail": f"Videos are not allowed ('{f.name}'). Only images, screenshots, docx, ppt, pdf, and excel files are supported."},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
-            TaskAttachment.objects.create(task=task, file=f, **attachment_kwargs)
+
+            clean_name = os.path.basename(getattr(f, "name", "attachment"))
+            if hasattr(f, "seek"):
+                try:
+                    f.seek(0)
+                except Exception:
+                    pass
+            file_bytes = f.read()
+
+            now = datetime.datetime.now()
+            subpath = f"task_attachments/{now.strftime('%Y/%m')}/{clean_name}"
+            if getattr(settings, "USE_S3_STORAGE", False):
+                try:
+                    saved_rel_path = default_storage.save(subpath, ContentFile(file_bytes, name=clean_name))
+                except Exception as s3_err:
+                    import logging
+                    logging.getLogger(__name__).warning("S3 save failed (%s), fallback to local storage", s3_err)
+                    saved_rel_path = local_fs.save(subpath, ContentFile(file_bytes, name=clean_name))
+            else:
+                saved_rel_path = local_fs.save(subpath, ContentFile(file_bytes, name=clean_name))
+
+            # Save the database row only after storage has succeeded. Marking the
+            # name committed prevents the model field from retrying the failed
+            # default S3 backend during save and breaking this transaction.
+            att = TaskAttachment(task=task, **attachment_kwargs)
+            att.file.name = saved_rel_path
+            att.file._committed = True
+            att.save()
+
+        for attachment in attachments_to_delete:
+            if attachment.file:
+                attachment.file.delete(save=False)
+            attachment.delete()
 
         if open_session:
             task.recalc_total_time()

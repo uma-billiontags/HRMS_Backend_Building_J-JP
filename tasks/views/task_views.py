@@ -3,20 +3,40 @@
 
 from django.shortcuts import get_object_or_404
 from rest_framework import status
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework.decorators import api_view, permission_classes, parser_classes
+from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
-from accounts.models import Employee
-from ..models import Task, TaskMaster
+from accounts.models import Employee, Admin
+from ..models import Task, TaskMaster, TaskAttachment, Notification
 from ..serializers import (
     TaskListSerializer, TaskCreateSerializer, TaskAssignSerializer,
-    TaskCreateAssignSerializer, TaskMasterSerializer, TaskMasterWriteSerializer
+    TaskCreateAssignSerializer, TaskMasterSerializer, TaskMasterWriteSerializer,
+    TaskAttachmentSerializer
 )
 from ..activity import ActivityLog, log_activity
 from ..notification_utils import send_notification
-from ..models import Notification
 from django.db import transaction
-from .utils import _is_admin, _current_employee, _is_tl, _can_manage_tasks, _owns_task_for_management, task_list_queryset
+import math
+from .utils import (
+    _is_admin, _current_employee, _is_tl, _can_manage_tasks,
+    _owns_task_for_management, task_list_queryset, _current_task_actor
+)
+
+
+def parse_due_time(time_str):
+    if not time_str:
+        return None
+    import datetime
+    if isinstance(time_str, datetime.time):
+        return time_str
+    time_str = str(time_str).strip()
+    for fmt in ("%H:%M:%S", "%H:%M", "%I:%M %p", "%I:%M%p", "%I:%M:%S %p", "%I:%M:%S%p"):
+        try:
+            return datetime.datetime.strptime(time_str, fmt).time()
+        except ValueError:
+            pass
+    return None
 
 
 @api_view(["POST"])
@@ -28,7 +48,7 @@ def create_task(request):
     serializer = TaskCreateSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
 
-    task = serializer.save(assigned_by_admin=request.user.instance)
+    task = serializer.save(assigned_by_admin=request.user.instance, created_by_admin=request.user.instance)
     return Response(TaskListSerializer(task).data, status=status.HTTP_201_CREATED)
 
 
@@ -77,6 +97,7 @@ def assign_task(request, pk):
 
     return Response(TaskListSerializer(task).data)
 
+
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def create_and_assign_task(request):
@@ -87,7 +108,11 @@ def create_and_assign_task(request):
     serializer.is_valid(raise_exception=True)
 
     with transaction.atomic():
-        task = serializer.save(assigned_by_admin=request.user.instance, task_status=Task.Status.NOT_STARTED)
+        task = serializer.save(
+            assigned_by_admin=request.user.instance,
+            created_by_admin=request.user.instance,
+            task_status=Task.Status.NOT_STARTED,
+        )
 
         log_activity(
             task, request.user, ActivityLog.Action.CREATED,
@@ -292,8 +317,27 @@ def get_project_tasks(request):
     project_name = request.query_params.get("project_name", "").strip()
     department = request.query_params.get("department", "").strip()
     mode = request.query_params.get("mode", "all").strip().lower()
+    bucket = request.query_params.get("bucket", "all").strip().lower()
+
+    if mode == "recurring":
+        from .recurring import generate_recurring_tasks
+        generate_recurring_tasks()
 
     qs = task_list_queryset()
+    if not _is_admin(request):
+        employee = _current_employee(request)
+        if employee is None:
+            return Response([], status=status.HTTP_200_OK)
+        from django.db.models import F, Q
+        if mode == "recurring":
+            qs = qs.filter(Q(assigned_to=employee) | Q(created_by_employee=employee))
+        else:
+            qs = qs.filter(assigned_to=employee)
+        qs = qs.order_by(
+            F("due_date").asc(nulls_last=True), F("due_time").asc(nulls_last=True), "id"
+        )
+    else:
+        qs = qs.order_by("-assigned_date", "-id")
     if department:
         qs = qs.filter(department=department)
     elif getattr(request.user, "role", None) == "employee" and getattr(request.user.instance, "department", None):
@@ -309,6 +353,35 @@ def get_project_tasks(request):
     elif mode == "recurring":
         qs = qs.filter(recurring_source__isnull=False)
 
+    if bucket == "active":
+        qs = qs.exclude(task_status__in=[
+            Task.Status.SUBMITTED,
+            Task.Status.UNDER_REVIEW,
+            Task.Status.RESUBMITTED,
+            Task.Status.COMPLETED,
+            Task.Status.CANCELLED,
+        ])
+    elif bucket == "submitted":
+        if _is_admin(request):
+            return Response({"detail": "Admins should use the review queue."}, status=status.HTTP_403_FORBIDDEN)
+        qs = qs.filter(task_status__in=[
+            Task.Status.SUBMITTED,
+            Task.Status.UNDER_REVIEW,
+            Task.Status.RESUBMITTED,
+        ])
+    elif bucket == "review":
+        if not _is_admin(request):
+            return Response({"detail": "Only admins can access the review queue."}, status=status.HTTP_403_FORBIDDEN)
+        qs = qs.filter(task_status__in=[
+            Task.Status.SUBMITTED,
+            Task.Status.UNDER_REVIEW,
+            Task.Status.RESUBMITTED,
+        ])
+    elif bucket == "completed":
+        qs = qs.filter(task_status=Task.Status.COMPLETED)
+    elif bucket == "backlog":
+        qs = qs.filter(assigned_to__isnull=True, assigned_to_admin__isnull=True)
+
     return Response(TaskListSerializer(qs, many=True).data)
 
 
@@ -317,8 +390,10 @@ def get_project_tasks(request):
 def quick_create_task(request):
     """
     POST /api/tasks/quick_create/
-    Jira-style quick inline create:
-    Body: { "task_name": "...", "project_name": "...", "department": "...", "assigned_to": id, "priority": "medium", "task_status": "not_started", "due_date": "...", "allotted_time": 1.5, "reporter_type": "admin"|"tl", "reporter_id": id }
+    Jira-style quick create supporting all fields:
+    task_name, project_name, department, assigned_to, assigned_to_admin, priority, task_status,
+    start_date, due_date, due_time, allotted_hours, allotted_minutes, allotted_time,
+    reporter_type, reporter_id, reporter, task_details
     """
     from django.utils import timezone
     from accounts.models import Admin, Employee
@@ -332,15 +407,38 @@ def quick_create_task(request):
     priority = request.data.get("priority") or "medium"
     status_val = request.data.get("task_status") or "not_started"
     assigned_to_id = request.data.get("assigned_to")
+    assigned_to_admin_id = request.data.get("assigned_to_admin")
+    start_date = request.data.get("start_date") or None
+    if not start_date:
+        start_date = timezone.localdate()
     due_date = request.data.get("due_date") or None
-    allotted_time = request.data.get("allotted_time") or 1.0
+    due_time = parse_due_time(request.data.get("due_time"))
+    task_details = str(request.data.get("task_details") or "").strip()
 
-    # Assignee: if assigned_to_id passed, use that; otherwise if regular employee, default to themselves!
+    # Calculate allotted_time from allotted_hours & allotted_minutes if provided
+    allotted_time = 1.0
+    try:
+        if "allotted_hours" in request.data or "allotted_minutes" in request.data:
+            h = float(request.data.get("allotted_hours") or 0)
+            m = float(request.data.get("allotted_minutes") or 0)
+            if h < 0 or m < 0 or m >= 60:
+                return Response({"detail": "Enter non-negative hours and minutes from 0 to 59."}, status=status.HTTP_400_BAD_REQUEST)
+            allotted_time = round(h + (m / 60.0), 2)
+        elif "allotted_time" in request.data and request.data.get("allotted_time") is not None:
+            allotted_time = float(request.data.get("allotted_time"))
+    except (ValueError, TypeError, OverflowError):
+        return Response({"detail": "Allotted time must be a valid number."}, status=status.HTTP_400_BAD_REQUEST)
+
+    if not math.isfinite(allotted_time) or allotted_time < 0 or allotted_time > 999999.99:
+        return Response({"detail": "Allotted time must be between 0 and 999999.99 hours."}, status=status.HTTP_400_BAD_REQUEST)
+
+    # Assignee: if assigned_to_admin_id, target Admin; if assigned_to_id passed, use Employee
     emp = None
-    if assigned_to_id:
+    target_admin = None
+    if assigned_to_admin_id:
+        target_admin = Admin.objects.filter(pk=assigned_to_admin_id).first()
+    elif assigned_to_id:
         emp = Employee.objects.filter(pk=assigned_to_id).first()
-    elif not _is_admin(request):
-        emp = request.user.instance
 
     if emp and not department:
         department = emp.department
@@ -377,22 +475,30 @@ def quick_create_task(request):
             assigned_by_admin = request.user.instance
         else:
             current_emp = request.user.instance
-            if current_emp and current_emp.belong_to_tl:
+            if current_emp and getattr(current_emp, "belong_to_admin", None):
+                assigned_by_admin = current_emp.belong_to_admin
+            elif current_emp and getattr(current_emp, "belong_to_tl", None):
                 assigned_by_employee = current_emp.belong_to_tl
             else:
                 assigned_by_admin = Admin.objects.first()
 
     task = Task.objects.create(
         task_name=task_name,
+        task_details=task_details,
         project_name=project_name,
         department=department,
         priority=priority,
         task_status=status_val,
         assigned_to=emp,
+        assigned_to_admin=target_admin,
         assigned_by_admin=assigned_by_admin,
         assigned_by_employee=assigned_by_employee,
+        created_by_admin=request.user.instance if _is_admin(request) else None,
+        created_by_employee=None if _is_admin(request) else request.user.instance,
+        start_date=start_date,
         assigned_date=timezone.localdate(),
         due_date=due_date,
+        due_time=due_time,
         allotted_time=allotted_time,
     )
 
@@ -503,7 +609,13 @@ def edit_task(request, pk):
     """
     try:
         task = get_object_or_404(Task, pk=pk)
-        if not _owns_task_for_management(request, task):
+        actor_kind, actor = _current_task_actor(request)
+        is_creator = (
+            actor_kind == "admin" and task.created_by_admin_id == actor.id
+        ) or (
+            actor_kind == "employee" and task.created_by_employee_id == actor.id
+        )
+        if not (_is_admin(request) or is_creator):
             return Response({"detail": "You do not have permission to edit this task."}, status=status.HTTP_403_FORBIDDEN)
 
         data = request.data
@@ -548,7 +660,7 @@ def edit_task(request, pk):
                 task.department = dept_val
         if "priority" in data and data.get("priority"):
             task.priority = data["priority"]
-        if "reporter" in data or "reporter_type" in data:
+        if (_is_admin(request) or is_creator) and ("reporter" in data or "reporter_type" in data):
             reporter_raw = data.get("reporter")
             reporter_type = data.get("reporter_type")
             reporter_id = data.get("reporter_id")
@@ -579,7 +691,7 @@ def edit_task(request, pk):
         if "due_date" in data:
             task.due_date = data["due_date"] or None
         if "due_time" in data:
-            task.due_time = data["due_time"] or None
+            task.due_time = parse_due_time(data["due_time"])
         if "allotted_time" in data and data.get("allotted_time") is not None:
             try:
                 from decimal import Decimal
@@ -645,6 +757,7 @@ DISALLOWED_VIDEO_EXTENSIONS = {
 
 @api_view(["POST", "GET"])
 @permission_classes([IsAuthenticated])
+@parser_classes([MultiPartParser, FormParser])
 def task_attachments_view(request, pk):
     """POST/GET /api/tasks/<int:pk>/attachments/"""
     task = get_object_or_404(Task, pk=pk)
@@ -656,6 +769,12 @@ def task_attachments_view(request, pk):
             return Response({"detail": "No file was uploaded."}, status=status.HTTP_400_BAD_REQUEST)
 
         import os
+        import datetime
+        from django.conf import settings
+        from django.core.files.storage import FileSystemStorage
+        from django.core.files.base import ContentFile
+        from django.utils import timezone
+
         # Reject video uploads
         for f in files:
             ext = os.path.splitext(f.name)[1].lower()
@@ -665,29 +784,110 @@ def task_attachments_view(request, pk):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
+        local_fs = FileSystemStorage(location=settings.MEDIA_ROOT, base_url=settings.MEDIA_URL)
         created = []
         creation_meta_list = list(task.task_creation_attachments or [])
         try:
             for f in files:
-                att = TaskAttachment.objects.create(task=task, file=f, is_creation_attachment=True, **attachment_kwargs)
+                clean_name = os.path.basename(getattr(f, "name", "attachment"))
+                now = datetime.datetime.now()
+
+                # Read raw file bytes safely first
+                if hasattr(f, "seek"):
+                    try:
+                        f.seek(0)
+                    except Exception:
+                        pass
+                file_bytes = f.read()
+
+                att = None
+                # If S3 is enabled, attempt S3 save, but gracefully fallback if network/boto3 fails
+                if getattr(settings, "USE_S3_STORAGE", False):
+                    try:
+                        cf_s3 = ContentFile(file_bytes, name=clean_name)
+                        att = TaskAttachment.objects.create(task=task, file=cf_s3, is_creation_attachment=True, **attachment_kwargs)
+                    except Exception as s3_err:
+                        import logging
+                        logging.getLogger(__name__).warning("S3 attachment save failed (%s); falling back to local storage.", s3_err)
+                        att = None
+
+                if att is None:
+                    # Save locally in MEDIA_ROOT
+                    subpath = f"task_attachments/{now.strftime('%Y/%m')}/{clean_name}"
+                    cf_local = ContentFile(file_bytes, name=clean_name)
+                    saved_rel_path = local_fs.save(subpath, cf_local)
+                    att = TaskAttachment(task=task, is_creation_attachment=True, **attachment_kwargs)
+                    att.file.name = saved_rel_path
+                    att.file._committed = True
+                    att.save()
+
                 created.append(att)
+
+                # Determine usable file url
+                file_url = ""
+                try:
+                    local_path = os.path.join(settings.MEDIA_ROOT, att.file.name)
+                    if os.path.exists(local_path):
+                        file_url = f"{settings.MEDIA_URL}{att.file.name}"
+                    else:
+                        file_url = att.file.url
+                except Exception:
+                    file_url = f"{settings.MEDIA_URL}{att.file.name}"
+
+                uploaded_at_iso = att.uploaded_at.isoformat() if att.uploaded_at else timezone.now().isoformat()
                 creation_meta_list.append({
                     "id": att.id,
-                    "name": os.path.basename(att.file.name),
-                    "file": att.file.url if hasattr(att.file, "url") else str(att.file),
-                    "size": att.file.size if hasattr(att.file, "size") else 0,
-                    "uploaded_at": att.uploaded_at.isoformat(),
+                    "name": clean_name,
+                    "file": file_url,
+                    "size": len(file_bytes) or getattr(f, "size", 0),
+                    "uploaded_at": uploaded_at_iso,
                 })
         except Exception as upload_err:
             import logging
             logging.getLogger(__name__).error("Attachment save failed: %s", upload_err)
             return Response({"detail": f"Failed to upload attachment: {str(upload_err)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-        task.task_creation_attachments = creation_meta_list
-        task.save(update_fields=["task_creation_attachments"])
+        with transaction.atomic():
+            task = Task.objects.select_for_update().get(pk=pk)
+            existing_meta = list(task.task_creation_attachments or [])
+            existing_ids = {m.get("id") for m in existing_meta if isinstance(m, dict)}
+            for m in creation_meta_list:
+                if m.get("id") not in existing_ids:
+                    existing_meta.append(m)
+                    existing_ids.add(m.get("id"))
+            task.task_creation_attachments = existing_meta
+            task.save(update_fields=["task_creation_attachments"])
 
         return Response(TaskAttachmentSerializer(task.attachments.all(), many=True).data, status=status.HTTP_201_CREATED)
     return Response(TaskAttachmentSerializer(task.attachments.all(), many=True).data)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def download_task_attachment(request, pk, att_id):
+    """GET /api/tasks/<int:pk>/attachments/<int:att_id>/download/"""
+    from django.http import FileResponse, Http404
+    import os
+    import mimetypes
+    from django.conf import settings
+
+    att = get_object_or_404(TaskAttachment, pk=att_id, task_id=pk)
+    if not att.file:
+        raise Http404("File not found")
+
+    clean_name = os.path.basename(att.file.name)
+    content_type, _ = mimetypes.guess_type(clean_name)
+    content_type = content_type or "application/octet-stream"
+
+    local_path = os.path.join(settings.MEDIA_ROOT, att.file.name)
+    if os.path.exists(local_path):
+        return FileResponse(open(local_path, "rb"), as_attachment=True, filename=clean_name, content_type=content_type)
+    else:
+        try:
+            return FileResponse(att.file.open("rb"), as_attachment=True, filename=clean_name, content_type=content_type)
+        except Exception:
+            from django.shortcuts import redirect
+            return redirect(att.file.url)
 
 
 @api_view(["POST", "GET"])
@@ -695,6 +895,18 @@ def task_attachments_view(request, pk):
 def task_comments_view(request, pk):
     """POST/GET /api/tasks/<int:pk>/comments/"""
     task = get_object_or_404(Task, pk=pk)
+    actor_kind, actor = _current_task_actor(request)
+    can_view_comments = _is_admin(request) or (
+        actor_kind == "employee" and (
+            task.assigned_to_id == actor.id or task.created_by_employee_id == actor.id or task.assigned_by_employee_id == actor.id
+        )
+    ) or (
+        actor_kind == "admin" and (
+            task.assigned_to_admin_id == actor.id or task.created_by_admin_id == actor.id or task.assigned_by_admin_id == actor.id
+        )
+    )
+    if not can_view_comments:
+        return Response({"detail": "You do not have permission to view or comment on this task."}, status=status.HTTP_403_FORBIDDEN)
     if request.method == "POST":
         comment_text = str(request.data.get("comment") or "").strip()
         if not comment_text:
